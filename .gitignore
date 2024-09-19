@@ -2,6 +2,7 @@
 multidatabackend*json
 # Python and virtual environment files
 output/
+luffy_dataset_3/
 temp/
 env.sh
 *.pem

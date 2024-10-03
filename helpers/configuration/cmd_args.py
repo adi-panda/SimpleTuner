@@ -13,7 +13,7 @@ from helpers.models.smoldit import SmolDiTConfigurationNames
 from helpers.training import quantised_precision_levels
 from helpers.training.optimizer_param import (
     is_optimizer_deprecated,
-    is_optimizer_bf16,
+    is_optimizer_grad_fp32,
     map_deprecated_optimizer_parameter,
     optimizer_choices,
 )
@@ -32,6 +32,11 @@ if torch.cuda.is_available():
     os.environ["NCCL_SOCKET_NTIMEO"] = "2000000"
 
 
+def print_on_main_thread(message):
+    if is_primary_process:
+        print(message)
+
+
 def info_log(message):
     if is_primary_process:
         logger.info(message)
@@ -47,9 +52,10 @@ def error_log(message):
         logger.error(message)
 
 
-def parse_cmdline_args(input_args=None):
+def get_argument_parser():
     parser = argparse.ArgumentParser(
-        description="The following SimpleTuner command-line options are available:"
+        description="The following SimpleTuner command-line options are available:",
+        exit_on_error=False,
     )
     parser.add_argument(
         "--snr_gamma",
@@ -324,7 +330,9 @@ def parse_cmdline_args(input_args=None):
         type=float,
         required=False,
         default=None,
-        help=("Setting this turns on perturbed normal initialization of the LyCORIS LoKr PEFT layers. A good value is between 1e-4 and 1e-2."),
+        help=(
+            "Setting this turns on perturbed normal initialization of the LyCORIS LoKr PEFT layers. A good value is between 1e-4 and 1e-2."
+        ),
     )
     parser.add_argument(
         "--controlnet",
@@ -694,9 +702,18 @@ def parse_cmdline_args(input_args=None):
         ),
     )
     parser.add_argument(
+        "--ignore_missing_files",
+        action="store_true",
+        help=(
+            "This option will disable the check for files that have been deleted or removed from your data directory."
+            " This would allow training on large datasets without keeping the associated images on disk, though it's"
+            " not recommended and is not a supported feature. Use with caution, as it mostly exists for experimentation."
+        ),
+    )
+    parser.add_argument(
         "--write_batch_size",
         type=int,
-        default=64,
+        default=128,
         help=(
             "When using certain storage backends, it is better to batch smaller writes rather than continuous dispatching."
             " In SimpleTuner, write batching is currently applied during VAE caching, when many small objects are written."
@@ -1132,6 +1149,30 @@ def parse_cmdline_args(input_args=None):
         ),
     )
     parser.add_argument(
+        "--optimizer_cpu_offload_method",
+        choices=["none"],  # , "torchao"],
+        default="none",
+        help=(
+            "This option is a placeholder. In the future, it will allow for the selection of different CPU offload methods."
+        ),
+    )
+    parser.add_argument(
+        "--optimizer_offload_gradients",
+        action="store_true",
+        default=False,
+        help=(
+            "When creating a CPU-offloaded optimiser, the gradients can be offloaded to the CPU to save more memory."
+        ),
+    )
+    parser.add_argument(
+        "--fuse_optimizer",
+        action="store_true",
+        default=False,
+        help=(
+            "When creating a CPU-offloaded optimiser, the fused optimiser could be used to save on memory, while running slightly slower."
+        ),
+    )
+    parser.add_argument(
         "--optimizer_beta1",
         type=float,
         default=None,
@@ -1265,8 +1306,8 @@ def parse_cmdline_args(input_args=None):
     )
     parser.add_argument(
         "--validation_torch_compile",
-        type=str,
-        default="false",
+        action="store_true",
+        default=False,
         help=(
             "Supply `--validation_torch_compile=true` to enable the use of torch.compile() on the validation pipeline."
             " For some setups, torch.compile() may error out. This is dependent on PyTorch version, phase of the moon,"
@@ -1314,6 +1355,15 @@ def parse_cmdline_args(input_args=None):
         help=(
             "The path to the webhook configuration file. This file should be a JSON file with the following format:"
             ' {"url": "https://your.webhook.url", "webhook_type": "discord"}}'
+        ),
+    )
+    parser.add_argument(
+        "--webhook_reporting_interval",
+        type=int,
+        default=None,
+        help=(
+            "When using 'raw' webhooks that receive structured data, you can specify a reporting interval here for"
+            " training progress updates to be sent at. This does not impact 'discord' webhook types."
         ),
     )
     parser.add_argument(
@@ -1481,6 +1531,17 @@ def parse_cmdline_args(input_args=None):
         ),
     )
     parser.add_argument(
+        "--quantize_via",
+        type=str,
+        choices=["cpu", "accelerator"],
+        default="accelerator",
+        help=(
+            "When quantising the model, the quantisation process can be done on the CPU or the accelerator."
+            " When done on the accelerator (default), slightly more VRAM is required, but the process completes in milliseconds."
+            " When done on the CPU, the process may take upwards of 60 seconds, but can complete without OOM on 16G cards."
+        ),
+    )
+    parser.add_argument(
         "--base_model_precision",
         type=str,
         default="no_change",
@@ -1490,6 +1551,13 @@ def parse_cmdline_args(input_args=None):
             " The default value, 'no_change', does not quantise any weights."
             " Using 'fp4-bnb' or 'fp8-bnb' will require Bits n Bytes for quantisation (NVIDIA, maybe AMD)."
             " Using 'fp8-quanto' will require Quanto for quantisation (Apple Silicon, NVIDIA, AMD)."
+        ),
+    )
+    parser.add_argument(
+        "--quantize_activations",
+        action="store_true",
+        help=(
+            "(EXPERIMENTAL) This option is currently unsupported, and exists solely for development purposes."
         ),
     )
     parser.add_argument(
@@ -1827,8 +1895,31 @@ def parse_cmdline_args(input_args=None):
         ),
     )
 
+    return parser
+
+
+def get_default_config():
+    parser = get_argument_parser()
+    default_config = {}
+    for action in parser.__dict__["_actions"]:
+        if action.dest:
+            default_config[action.dest] = action.default
+
+    return default_config
+
+
+def parse_cmdline_args(input_args=None):
+    parser = get_argument_parser()
     if input_args is not None:
-        args = parser.parse_args(input_args)
+        for key_val in input_args:
+            print_on_main_thread(f"{key_val}")
+        try:
+            args = parser.parse_args(input_args)
+        except:
+            logger.error(f"Could not parse input: {input_args}")
+            import traceback
+
+            logger.error(traceback.format_exc())
     else:
         args = parser.parse_args()
 
@@ -1897,12 +1988,6 @@ def parse_cmdline_args(input_args=None):
             f"When using --resolution_type=pixel, --target_downsample_size must be at least 512 pixels. You may have accidentally entered {args.target_downsample_size} megapixels, instead of pixels."
         )
 
-    if "int4" in args.base_model_precision and torch.cuda.is_available():
-        print(
-            "WARNING: int4 precision is ONLY supported on A100 and H100 or newer devices. Waiting 10 seconds to continue.."
-        )
-        time.sleep(10)
-
     model_is_bf16 = (
         args.base_model_precision == "no_change"
         and (args.mixed_precision == "bf16" or torch.backends.mps.is_available())
@@ -1924,6 +2009,15 @@ def parse_cmdline_args(input_args=None):
         raise ValueError(
             f"Model is not using bf16 precision, but the optimizer {chosen_optimizer} requires it."
         )
+    if is_optimizer_grad_fp32(args.optimizer):
+        warning_log(
+            "Using an optimizer that requires fp32 gradients. Training will potentially run more slowly."
+        )
+        if args.gradient_precision != "fp32":
+            args.gradient_precision = "fp32"
+    else:
+        if args.gradient_precision == "fp32":
+            args.gradient_precision = "unmodified"
 
     if torch.backends.mps.is_available():
         if (
@@ -1940,6 +2034,12 @@ def parse_cmdline_args(input_args=None):
                 "\nPlease reduce the batch size to 12 or lower."
             )
             sys.exit(1)
+
+        if args.quantize_via == "accelerator":
+            error_log(
+                "MPS does not benefit from models being quantized on the accelerator device. Overriding --quantize_via to 'cpu'."
+            )
+            args.quantize_via = "cpu"
 
     if (
         args.max_train_steps is not None
@@ -1995,7 +2095,7 @@ def parse_cmdline_args(input_args=None):
         args.resolution_type = "pixel"
 
     validation_resolution_is_float = False
-    if "." in args.validation_resolution:
+    if "." in str(args.validation_resolution):
         try:
             # this makes handling for int() conversion easier later.
             args.validation_resolution = float(args.validation_resolution)
@@ -2031,10 +2131,6 @@ def parse_cmdline_args(input_args=None):
 
     if args.metadata_update_interval < 60:
         raise ValueError("Metadata update interval must be at least 60 seconds.")
-    if args.validation_torch_compile == "true":
-        args.validation_torch_compile = True
-    else:
-        args.validation_torch_compile = False
 
     if args.model_family == "sd3":
         args.pretrained_vae_model_name_or_path = None
@@ -2064,7 +2160,7 @@ def parse_cmdline_args(input_args=None):
         or args.flux_fast_schedule
     ):
         if not args.flux_fast_schedule:
-            logger.error("Schnell requires --flux_fast_schedule.")
+            error_log("Schnell requires --flux_fast_schedule.")
             sys.exit(1)
         flux_version = "schnell"
         model_max_seq_length = 256
@@ -2101,11 +2197,11 @@ def parse_cmdline_args(input_args=None):
             )
 
         if args.flux_guidance_mode == "mobius":
-            logger.warning(
+            warning_log(
                 "Mobius training is only for the most elite. Pardon my English, but this is not for those who don't like to destroy something beautiful every now and then. If you feel perhaps this is not for you, please consider using a different guidance mode."
             )
             if args.flux_guidance_min < 1.0:
-                logger.warning(
+                warning_log(
                     "Flux minimum guidance value for Mobius training is 1.0. Updating value.."
                 )
                 args.flux_guidance_min = 1.0
@@ -2162,13 +2258,13 @@ def parse_cmdline_args(input_args=None):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         if args.disable_tf32:
-            logger.warning(
+            warning_log(
                 "--disable_tf32 is provided, not enabling. Training will potentially be much slower."
             )
             torch.backends.cuda.matmul.allow_tf32 = False
             torch.backends.cudnn.allow_tf32 = False
         else:
-            logger.info(
+            info_log(
                 "Enabled NVIDIA TF32 for faster training on Ampere GPUs. Use --disable_tf32 if this causes any problems."
             )
 
@@ -2187,9 +2283,7 @@ def parse_cmdline_args(input_args=None):
     )
     args.disable_accelerator = os.environ.get("SIMPLETUNER_DISABLE_ACCELERATOR", False)
 
-    if "lora" not in args.model_type:
-        args.base_model_precision = "no_change"
-    elif "lycoris" == args.lora_type.lower():
+    if "lycoris" == args.lora_type.lower():
         from lycoris import create_lycoris
 
         if args.lycoris_config is None:
@@ -2240,7 +2334,7 @@ def parse_cmdline_args(input_args=None):
                 )
                 args.use_dora = False
             else:
-                logger.warning(
+                warning_log(
                     "DoRA support is experimental and not very thoroughly tested."
                 )
                 args.lora_initialisation_style = "default"
@@ -2251,7 +2345,7 @@ def parse_cmdline_args(input_args=None):
         args.data_backend_config = os.path.join(
             StateTracker.get_config_path(), "multidatabackend.json"
         )
-        logger.warning(
+        warning_log(
             f"No data backend config provided. Using default config at {args.data_backend_config}."
         )
 

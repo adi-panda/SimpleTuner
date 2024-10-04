@@ -1060,7 +1060,7 @@ options:
                         updates. Checkpoints can be used for resuming training
                         via `--resume_from_checkpoint`. In the case that the
                         checkpoint is better than the final trained model, the
-                        checkpoint can also be used for inference.Using a
+                        checkpoint can also be used for inference. Using a
                         checkpoint for inference requires separate loading of
                         the original pipeline and the individual checkpointed
                         model components.See https://huggingface.co/docs/diffu

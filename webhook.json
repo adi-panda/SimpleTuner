@@ -1,0 +1,5 @@
+{
+    "webhook_url": "https://discord.com/api/webhooks/1291443613737160778/RDZWtqapGxyLAa4UQntiQq7Cbdks2dH4pUb4rvVMiWEVWsUMGY-riEjVs9eB82llFnlD",
+    "webhook_type": "discord",
+    "log_level": "info"
+}

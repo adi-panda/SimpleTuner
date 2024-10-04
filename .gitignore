@@ -2,7 +2,8 @@
 multidatabackend*json
 # Python and virtual environment files
 output/
-luffy_dataset_3/
+luffy_dataset_*
+luffy_dataset_clean/
 temp/
 env.sh
 *.pem
@@ -57,6 +58,8 @@ config/*.env
 wandb/
 cache/
 vae_cache/
+embed-cache/
+vae-cache/
 vendor/
 inference/
 webhooks.json

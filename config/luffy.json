@@ -1,0 +1,31 @@
+[
+    {
+        "id": "luffy-512",
+        "type": "local",
+        "instance_data_dir": "/home/azureuser/localfiles/SimpleTuner/luffy_full",
+        "crop": false,
+        "resolution": 512,
+        "resolution_type": "pixel_area",
+        "minimum_image_size": 512,
+        "maximum_image_size": 512,
+        "target_downsample_size": 512,
+        "prepend_instance_prompt": false,
+        "instance_prompt": "",
+        "only_instance_prompt": false,
+        "caption_strategy": "textfile",
+        "cache_dir_vae": "/home/azureuser/localfiles/SimpleTuner/vae-cache/luffy-512",
+        "probability": 1.0,
+        "repeats": 2,
+        "preserve_data_backend_cache": true,
+        "cache_file_suffix": "-luffy-512"
+    },
+    {
+        "id": "luffy-text-embeds",
+        "type": "local",
+        "dataset_type": "text_embeds",
+        "default": true,
+        "cache_dir": "/home/azureuser/localfiles/SimpleTuner/embed-cache/luffy",
+        "disabled": false,
+        "write_batch_size": 128
+    }
+]

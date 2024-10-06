@@ -4,11 +4,12 @@ multidatabackend*json
 output/
 luffy_dataset_*
 luffy_dataset_clean/
+luffy_full/
 temp/
 env.sh
 *.pem
-*/config/config.json
-user_prompt_library.json
+# */config/config.json
+# user_prompt_library.json
 __pycache__/
 .venv/
 cache/
@@ -53,8 +54,8 @@ work
 multidatabackend.json
 multidatabackend_sd2x.json
 
-config/*.json
-config/*.env
+# config/*.json
+# config/*.env
 wandb/
 cache/
 vae_cache/
@@ -64,7 +65,7 @@ vendor/
 inference/
 webhooks.json
 untracked/
-config/*/
+# config/*/
 config/*.toml
 static
 templates

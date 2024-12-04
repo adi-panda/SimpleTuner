@@ -8,6 +8,7 @@ from botocore.exceptions import (
 )
 import fnmatch
 import logging
+import torch
 from torch import Tensor
 import concurrent.futures
 from botocore.config import Config
@@ -45,7 +46,7 @@ logger.setLevel(os.environ.get("SIMPLETUNER_LOG_LEVEL", "INFO"))
 
 class S3DataBackend(BaseDataBackend):
     # Storing the list_files output in a local dict.
-    _list_cache = {}
+    _list_cache: dict = {}
 
     def __init__(
         self,
@@ -91,19 +92,36 @@ class S3DataBackend(BaseDataBackend):
             **extra_args,
         )
 
-    def exists(self, s3_key) -> bool:
-        """Determine whether a file exists in S3."""
-        try:
-            # logger.debug(f"Checking if file exists: {s3_key}")
-            self.client.head_object(Bucket=self.bucket_name, Key=str(s3_key))
-            return True
-        # Catch the error when the file does not exist
-        except (Exception, self.client.exceptions.NoSuchKey) as e:
-            if "Not Found" not in str(e) and "Bad Request" not in str(e):
-                raise
-            return False
-        except:
-            return False
+    def exists(self, s3_key):
+        """Check if the key exists in S3, with retries for transient errors."""
+        for i in range(self.read_retry_limit):
+            try:
+                self.client.head_object(Bucket=self.bucket_name, Key=str(s3_key))
+                return True
+            except self.client.exceptions.NoSuchKey:
+                logger.debug(
+                    f"File {s3_key} does not exist in S3 bucket ({self.bucket_name})"
+                )
+                return False
+            except (NoCredentialsError, PartialCredentialsError) as e:
+                raise e  # Raise credential errors to the caller
+            except Exception as e:
+                if "An error occurred (404) when calling the HeadObject operation: Not Found" in str(e):
+                    return False
+                logger.error(f'Error checking existence of S3 key "{s3_key}": {e}')
+                if i == self.read_retry_limit - 1:
+                    # We have reached our maximum retry count.
+                    raise e
+                else:
+                    # Sleep for a bit before retrying.
+                    time.sleep(self.read_retry_interval)
+            except:
+                if i == self.read_retry_limit - 1:
+                    # We have reached our maximum retry count.
+                    raise
+                else:
+                    # Sleep for a bit before retrying.
+                    time.sleep(self.read_retry_interval)
 
     def read(self, s3_key):
         """Retrieve and return the content of the file from S3."""
@@ -289,47 +307,73 @@ class S3DataBackend(BaseDataBackend):
         # Since S3 doesn't have a traditional directory structure, this is just a pass-through
         pass
 
-    def torch_load(self, s3_key):
-        import torch
-        from io import BytesIO
+    def _detect_file_format(self, fileobj):
+        fileobj.seek(0)
+        magic_number = fileobj.read(4)
+        fileobj.seek(0)
+        logger.debug(f"Magic number: {magic_number}")
+        if magic_number[:2] == b"\x80\x04" or b"PK" in magic_number:
+            # This is likely a torch-saved object (Pickle protocol 4)
+            # Need to check whether it's the incorrectly saved compressed data
+            try:
+                obj = torch.load(fileobj, map_location="cpu")
+                if isinstance(obj, bytes):
+                    # If obj is bytes, it means compressed data was saved incorrectly
+                    return "incorrect"
+                else:
+                    return "correct_uncompressed"
+            except Exception as e:
+                # If torch.load fails, it's possibly compressed correctly
+                return "correct_compressed"
+        elif magic_number[:2] == b"\x1f\x8b":
+            # GZIP magic number, compressed data saved correctly
+            return "correct_compressed"
+        else:
+            # Unrecognized format
+            return "unknown"
 
-        # Retry the torch load within the retry limit
+    def torch_load(self, s3_key):
         for i in range(self.read_retry_limit):
             try:
-                stored_tensor = BytesIO(self.read(s3_key))
-                if self.compress_cache:
-                    try:
-                        stored_tensor = self._decompress_torch(stored_tensor)
-                    except Exception as e:
-                        logger.error(
-                            f"Failed to decompress torch file, falling back to passthrough: {e}"
-                        )
+                # Read data from S3
+                data = self.read(s3_key)
+                stored_data = BytesIO(data)
+                stored_data.seek(0)
+
+                # Determine if the file was saved incorrectly
+                file_format = self._detect_file_format(stored_data)
+                logger.debug(f"File format: {file_format}")
+                if file_format == "incorrect":
+                    # Load the compressed bytes object serialized by torch.save
+                    stored_data.seek(0)
+                    compressed_data = BytesIO(
+                        torch.load(stored_data, map_location="cpu")
+                    )
+                    # Decompress the data
+                    stored_tensor = self._decompress_torch(compressed_data)
+                elif file_format == "correct_compressed":
+                    # Data is compressed but saved correctly
+                    decompressed_data = self._decompress_torch(data)
+                else:
+                    # Data is uncompressed and saved correctly
+                    stored_tensor = stored_data
+
                 if hasattr(stored_tensor, "seek"):
                     stored_tensor.seek(0)
-
                 obj = torch.load(stored_tensor, map_location="cpu")
-                # logger.debug(f"torch.load found: {obj}")
-                if type(obj) is tuple:
+
+                if isinstance(obj, tuple):
                     obj = tuple(o.to(torch.float32) for o in obj)
-                elif type(obj) is Tensor:
+                elif isinstance(obj, torch.Tensor):
                     obj = obj.to(torch.float32)
 
                 return obj
             except Exception as e:
-                if not self.exists(s3_key):
-                    logger.debug(f"File {s3_key} does not exist in S3 bucket.")
-                    raise FileNotFoundError(f"{s3_key} not found.")
-                logger.error(f"Error loading torch file (path: {s3_key}): {e}")
-                if str(e) == "Ran out of input":
-                    logger.error(f"File {s3_key} is empty. Deleting it from S3.")
-                    self.delete(s3_key)
-                    raise FileNotFoundError(f"{s3_key} not found.")
+                logging.error(f"Failed to load tensor from {s3_key}: {e}")
                 if i == self.read_retry_limit - 1:
-                    # We have reached our maximum retry count.
-                    raise e
+                    raise
                 else:
-                    # Sleep for a bit before retrying.
-                    time.sleep(self.read_retry_interval)
+                    logging.info(f"Retrying... ({i+1}/{self.read_retry_limit})")
 
     def torch_save(self, data, s3_key):
         import torch
@@ -340,8 +384,11 @@ class S3DataBackend(BaseDataBackend):
             try:
                 buffer = BytesIO()
                 if self.compress_cache:
-                    data = self._compress_torch(data)
-                torch.save(data, buffer)
+                    compressed_data = self._compress_torch(data)
+                    buffer.write(compressed_data)
+                else:
+                    torch.save(data, buffer)
+                buffer.seek(0)  # Reset buffer position to the beginning
                 logger.debug(f"Writing torch file: {s3_key}")
                 result = self.write(s3_key, buffer.getvalue())
                 logger.debug(f"Write completed: {s3_key}")

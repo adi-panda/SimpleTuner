@@ -144,8 +144,9 @@ class VAECache(WebhookMixin):
         subfolders = ""
         if self.instance_data_dir is not None:
             subfolders = os.path.dirname(filepath).replace(self.instance_data_dir, "")
-        if len(subfolders) > 0 and subfolders[0] == "/" and self.cache_dir[0] != "/":
-            subfolders = subfolders[1:]
+            subfolders = subfolders.lstrip(os.sep)
+
+        if len(subfolders) > 0:
             full_filename = os.path.join(self.cache_dir, subfolders, base_filename)
             # logger.debug(
             #     f"full_filename: {full_filename} = os.path.join({self.cache_dir}, {subfolders}, {base_filename})"
@@ -160,10 +161,6 @@ class VAECache(WebhookMixin):
     def _image_filename_from_vaecache_filename(self, filepath: str) -> tuple[str, str]:
         test_filepath, _ = self.generate_vae_cache_filename(filepath)
         result = self.vae_path_to_image_path.get(test_filepath, None)
-        if result is None:
-            raise ValueError(
-                f"Could not find image path for cache file {filepath} (test_filepath: {test_filepath}). This occurs when you toggle the value for hashed_filenames without clearing your VAE cache. If it still occurs after clearing the cache, please open an issue: https://github.com/bghira/simpletuner/issues"
-            )
 
         return result
 
@@ -369,6 +366,8 @@ class VAECache(WebhookMixin):
         for cache_file in existing_cache_files:
             try:
                 n = self._image_filename_from_vaecache_filename(cache_file)
+                if n is None:
+                    continue
                 already_cached_images.append(n)
             except Exception as e:
                 logger.error(
@@ -955,6 +954,8 @@ class VAECache(WebhookMixin):
                     test_filepath = self._image_filename_from_vaecache_filename(
                         filepath
                     )
+                    if test_filepath is None:
+                        continue
                     if test_filepath not in self.local_unprocessed_files:
                         statistics["not_local"] += 1
                         continue

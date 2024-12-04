@@ -24,6 +24,8 @@ import threading
 from tqdm import tqdm
 import queue
 from math import sqrt
+import pandas as pd
+import numpy as np
 
 logger = logging.getLogger("DataBackendFactory")
 if should_log():
@@ -46,6 +48,70 @@ def prefetch_log_debug(message):
 def info_log(message):
     if StateTracker.get_accelerator().is_main_process:
         logger.info(message)
+
+
+def check_column_values(
+    column_data, column_name, parquet_path, fallback_caption_column=False
+):
+    # Determine if the column contains arrays or scalar values
+    non_null_values = column_data.dropna()
+    if non_null_values.empty:
+        # All values are null
+        raise ValueError(
+            f"Parquet file {parquet_path} contains only null values in the '{column_name}' column."
+        )
+
+    first_non_null = non_null_values.iloc[0]
+    if isinstance(first_non_null, (list, tuple, np.ndarray, pd.Series)):
+        # Column contains arrays
+        # Check for null arrays
+        if column_data.isnull().any() and not fallback_caption_column:
+            raise ValueError(
+                f"Parquet file {parquet_path} contains null arrays in the '{column_name}' column."
+            )
+
+        # Check for empty arrays
+        empty_arrays = column_data.apply(lambda x: len(x) == 0)
+        if empty_arrays.any() and not fallback_caption_column:
+            raise ValueError(
+                f"Parquet file {parquet_path} contains empty arrays in the '{column_name}' column."
+            )
+
+        # Check for null elements within arrays
+        null_elements_in_arrays = column_data.apply(
+            lambda arr: any(pd.isnull(s) for s in arr)
+        )
+        if null_elements_in_arrays.any() and not fallback_caption_column:
+            raise ValueError(
+                f"Parquet file {parquet_path} contains null values within arrays in the '{column_name}' column."
+            )
+
+        # Check for empty strings within arrays
+        empty_strings_in_arrays = column_data.apply(
+            lambda arr: any(s == "" for s in arr)
+        )
+        if empty_strings_in_arrays.all() and not fallback_caption_column:
+            raise ValueError(
+                f"Parquet file {parquet_path} contains only empty strings within arrays in the '{column_name}' column."
+            )
+
+    elif isinstance(first_non_null, str):
+        # Column contains scalar strings
+        # Check for null values
+        if column_data.isnull().any() and not fallback_caption_column:
+            raise ValueError(
+                f"Parquet file {parquet_path} contains null values in the '{column_name}' column."
+            )
+
+        # Check for empty strings
+        if (column_data == "").any() and not fallback_caption_column:
+            raise ValueError(
+                f"Parquet file {parquet_path} contains empty strings in the '{column_name}' column."
+            )
+    else:
+        raise TypeError(
+            f"Unsupported data type in column '{column_name}'. Expected strings or arrays of strings."
+        )
 
 
 def init_backend_config(backend: dict, args: dict, accelerator) -> dict:
@@ -118,12 +184,22 @@ def init_backend_config(backend: dict, args: dict, accelerator) -> dict:
         if (
             output["config"]["crop_aspect"] == "random"
             or output["config"]["crop_aspect"] == "closest"
-        ) and "crop_aspect_buckets" not in backend:
-            raise ValueError(
-                f"(id={backend['id']}) crop_aspect_buckets must be provided when crop_aspect is set to 'random'."
-                " This should be a list of float values or a list of dictionaries following the format: {'aspect_bucket': float, 'weight': float}."
-                " The weight represents how likely this bucket is to be chosen, and all weights should add up to 1.0 collectively."
-            )
+        ):
+            if "crop_aspect_buckets" not in backend or not isinstance(
+                backend["crop_aspect_buckets"], list
+            ):
+                raise ValueError(
+                    f"(id={backend['id']}) crop_aspect_buckets must be provided when crop_aspect is set to 'random'."
+                    " This should be a list of float values or a list of dictionaries following the format: {'aspect_bucket': float, 'weight': float}."
+                    " The weight represents how likely this bucket is to be chosen, and all weights should add up to 1.0 collectively."
+                )
+            for bucket in backend.get("crop_aspect_buckets"):
+                if type(bucket) not in [float, int, dict]:
+                    raise ValueError(
+                        f"(id={backend['id']}) crop_aspect_buckets must be a list of float values or a list of dictionaries following the format: {'aspect_bucket': float, 'weight': float}."
+                        " The weight represents how likely this bucket is to be chosen, and all weights should add up to 1.0 collectively."
+                    )
+
         output["config"]["crop_aspect_buckets"] = backend.get("crop_aspect_buckets")
     else:
         output["config"]["crop_aspect"] = "square"
@@ -282,24 +358,23 @@ def configure_parquet_database(backend: dict, args, data_backend: BaseDataBacken
         raise ValueError(
             f"Parquet file {parquet_path} does not contain a column named '{filename_column}'."
         )
-    # Check for null values
-    if df[caption_column].isnull().values.any() and not fallback_caption_column:
-        raise ValueError(
-            f"Parquet file {parquet_path} contains null values in the '{caption_column}' column, but no fallback_caption_column was set."
-        )
-    if df[filename_column].isnull().values.any():
-        raise ValueError(
-            f"Parquet file {parquet_path} contains null values in the '{filename_column}' column."
-        )
-    # Check for empty strings
-    if (df[caption_column] == "").sum() > 0 and not fallback_caption_column:
-        raise ValueError(
-            f"Parquet file {parquet_path} contains empty strings in the '{caption_column}' column."
-        )
-    if (df[filename_column] == "").sum() > 0:
-        raise ValueError(
-            f"Parquet file {parquet_path} contains empty strings in the '{filename_column}' column."
-        )
+
+    # Apply the function to the caption_column.
+    check_column_values(
+        df[caption_column],
+        caption_column,
+        parquet_path,
+        fallback_caption_column=fallback_caption_column,
+    )
+
+    # Apply the function to the filename_column.
+    check_column_values(
+        df[filename_column],
+        filename_column,
+        parquet_path,
+        fallback_caption_column=False,  # Always check filename_column
+    )
+
     # Store the database in StateTracker
     StateTracker.set_parquet_database(
         backend["id"],
@@ -335,7 +410,7 @@ def configure_multi_databackend(args: dict, accelerator, text_encoders, tokenize
             f"Data backend config file {args.data_backend_config} not found."
         )
     info_log(f"Loading data backend config from {args.data_backend_config}")
-    with open(args.data_backend_config, "r") as f:
+    with open(args.data_backend_config, "r", encoding="utf-8") as f:
         data_backend_config = json.load(f)
     if len(data_backend_config) == 0:
         raise ValueError(
@@ -420,7 +495,7 @@ def configure_multi_databackend(args: dict, accelerator, text_encoders, tokenize
             accelerator=accelerator,
             cache_dir=init_backend.get("cache_dir", args.cache_dir_text),
             model_type=StateTracker.get_model_family(),
-            write_batch_size=backend.get("write_batch_size", 1),
+            write_batch_size=backend.get("write_batch_size", args.write_batch_size),
         )
         init_backend["text_embed_cache"].set_webhook_handler(
             StateTracker.get_webhook_handler()
@@ -443,7 +518,7 @@ def configure_multi_databackend(args: dict, accelerator, text_encoders, tokenize
             accelerator.wait_for_everyone()
         if args.caption_dropout_probability == 0.0:
             logger.warning(
-                "Not using caption dropout will potentially lead to overfitting on captions, eg. CFG will not work very well. Set --caption-dropout_probability=0.1 as a recommended value."
+                "Not using caption dropout will potentially lead to overfitting on captions, eg. CFG will not work very well. Set --caption_dropout_probability=0.1 as a recommended value."
             )
 
         # We don't compute the text embeds at this time, because we do not really have any captions available yet.
@@ -549,15 +624,22 @@ def configure_multi_databackend(args: dict, accelerator, text_encoders, tokenize
             or backend["id"] in StateTracker.get_data_backends()
         ):
             raise ValueError("Each dataset needs a unique 'id' field.")
+        info_log(f"Configuring data backend: {backend['id']}")
+        conditioning_type = backend.get("conditioning_type")
+        if (
+            backend.get("dataset_type") == "conditioning"
+            or conditioning_type is not None
+        ):
+            backend["dataset_type"] = "conditioning"
         resolution_type = backend.get("resolution_type", args.resolution_type)
         if resolution_type == "pixel_area":
-            pixel_edge_length = backend.get("resolution")
+            pixel_edge_length = backend.get("resolution", int(args.resolution))
             if pixel_edge_length is None or (
                 type(pixel_edge_length) is not int
                 or not str(pixel_edge_length).isdigit()
             ):
                 raise ValueError(
-                    f"Resolution type 'pixel_area' requires a 'resolution' field to be set in the backend config using an integer in the format: 1024"
+                    f"Resolution type 'pixel_area' requires a 'resolution' field to be set in the backend config using an integer in the format: 1024, but {pixel_edge_length} was given"
                 )
             # we'll convert pixel_area to area
             backend["resolution_type"] = "area"
@@ -586,7 +668,6 @@ def configure_multi_databackend(args: dict, accelerator, text_encoders, tokenize
                     backend["minimum_image_size"] * backend["minimum_image_size"]
                 ) / 1_000_000
 
-        info_log(f"Configuring data backend: {backend['id']}")
         # Retrieve some config file overrides for commandline arguments, eg. cropping
         init_backend = init_backend_config(backend, args, accelerator)
         StateTracker.set_data_backend_config(
@@ -739,8 +820,10 @@ def configure_multi_databackend(args: dict, accelerator, text_encoders, tokenize
             **metadata_backend_args,
         )
 
-        if "aspect" not in args.skip_file_discovery and "aspect" not in backend.get(
-            "skip_file_discovery", ""
+        if (
+            "aspect" not in args.skip_file_discovery
+            and "aspect" not in backend.get("skip_file_discovery", "")
+            and conditioning_type not in ["mask", "controlnet"]
         ):
             if accelerator.is_local_main_process:
                 info_log(
@@ -819,12 +902,15 @@ def configure_multi_databackend(args: dict, accelerator, text_encoders, tokenize
         info_log(f"Configured backend: {init_backend}")
 
         print_bucket_info(init_backend["metadata_backend"])
-        if len(init_backend["metadata_backend"]) == 0:
+        if len(init_backend["metadata_backend"]) == 0 and conditioning_type is None:
             raise Exception(
                 f"No images were discovered by the bucket manager in the dataset: {init_backend['id']}."
             )
 
         use_captions = True
+        is_regularisation_data = backend.get(
+            "is_regularisation_data", backend.get("is_regularization_data", False)
+        )
         if "only_instance_prompt" in backend and backend["only_instance_prompt"]:
             use_captions = False
         elif args.only_instance_prompt:
@@ -832,6 +918,7 @@ def configure_multi_databackend(args: dict, accelerator, text_encoders, tokenize
         init_backend["train_dataset"] = MultiAspectDataset(
             id=init_backend["id"],
             datasets=[init_backend["metadata_backend"]],
+            is_regularisation_data=is_regularisation_data,
         )
 
         if "deepfloyd" in args.model_type:
@@ -877,6 +964,8 @@ def configure_multi_databackend(args: dict, accelerator, text_encoders, tokenize
                 "prepend_instance_prompt", args.prepend_instance_prompt
             ),
             instance_prompt=backend.get("instance_prompt", args.instance_prompt),
+            conditioning_type=conditioning_type,
+            is_regularisation_data=is_regularisation_data,
         )
         if init_backend["sampler"].caption_strategy == "parquet":
             configure_parquet_database(backend, args, init_backend["data_backend"])
@@ -906,8 +995,10 @@ def configure_multi_databackend(args: dict, accelerator, text_encoders, tokenize
         StateTracker.register_data_backend(init_backend)
 
         # We get captions from the IMAGE dataset. Not the text embeds dataset.
-        if "text" not in args.skip_file_discovery and "text" not in backend.get(
-            "skip_file_discovery", ""
+        if (
+            conditioning_type != "mask"
+            and "text" not in args.skip_file_discovery
+            and "text" not in backend.get("skip_file_discovery", "")
         ):
             info_log(f"(id={init_backend['id']}) Collecting captions.")
             captions = PromptHandler.get_all_captions(
@@ -943,7 +1034,10 @@ def configure_multi_databackend(args: dict, accelerator, text_encoders, tokenize
         StateTracker.set_data_backend_config(init_backend["id"], init_backend["config"])
         logger.debug(f"Hashing filenames: {hash_filenames}")
 
-        if "deepfloyd" not in StateTracker.get_args().model_type:
+        if (
+            "deepfloyd" not in StateTracker.get_args().model_type
+            and conditioning_type not in ["mask", "controlnet"]
+        ):
             info_log(f"(id={init_backend['id']}) Creating VAE latent cache.")
             vae_cache_dir = backend.get("cache_dir_vae", None)
             if vae_cache_dir in vae_cache_dir_paths:
@@ -958,6 +1052,13 @@ def configure_multi_databackend(args: dict, accelerator, text_encoders, tokenize
             ):
                 raise ValueError(
                     f"VAE image embed cache directory {backend.get('cache_dir_vae')} is the same as the text embed cache directory. This is not allowed, the trainer will get confused."
+                )
+
+            if backend["type"] == "local" and (
+                vae_cache_dir is None or vae_cache_dir == ""
+            ):
+                raise ValueError(
+                    f"VAE image embed cache directory {backend.get('cache_dir_vae')} is not set. This is required for the VAE image embed cache."
                 )
             init_backend["vaecache"] = VAECache(
                 id=init_backend["id"],
@@ -1021,6 +1122,7 @@ def configure_multi_databackend(args: dict, accelerator, text_encoders, tokenize
             and accelerator.is_main_process
             and backend.get("scan_for_errors", False)
             and "deepfloyd" not in StateTracker.get_args().model_type
+            and conditioning_type not in ["mask", "controlnet"]
         ):
             info_log(
                 f"Beginning error scan for dataset {init_backend['id']}. Set 'scan_for_errors' to False in the dataset config to disable this."
@@ -1040,8 +1142,11 @@ def configure_multi_databackend(args: dict, accelerator, text_encoders, tokenize
 
         if (
             not args.vae_cache_ondemand
+            and "vaecache" in init_backend
             and "vae" not in args.skip_file_discovery
             and "vae" not in backend.get("skip_file_discovery", "")
+            and "deepfloyd" not in StateTracker.get_args().model_type
+            and conditioning_type not in ["mask", "controlnet"]
         ):
             init_backend["vaecache"].discover_unprocessed_files()
             if not args.vae_cache_ondemand:

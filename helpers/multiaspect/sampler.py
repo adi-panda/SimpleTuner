@@ -38,6 +38,8 @@ class MultiAspectSampler(torch.utils.data.Sampler):
         use_captions=True,
         prepend_instance_prompt=False,
         instance_prompt: str = None,
+        conditioning_type: str = None,
+        is_regularisation_data: bool = False,
     ):
         """
         Initializes the sampler with provided settings.
@@ -60,6 +62,14 @@ class MultiAspectSampler(torch.utils.data.Sampler):
             f"MultiAspectSampler-{self.id}",
             os.environ.get("SIMPLETUNER_LOG_LEVEL", "INFO"),
         )
+        if conditioning_type is not None:
+            if conditioning_type not in ["controlnet", "mask"]:
+                raise ValueError(
+                    f"Unknown conditioning image type: {conditioning_type}"
+                )
+        self.conditioning_type = conditioning_type
+        self.is_regularisation_data = is_regularisation_data
+
         self.rank_info = rank_info()
         self.accelerator = accelerator
         self.metadata_backend = metadata_backend
@@ -368,15 +378,19 @@ class MultiAspectSampler(torch.utils.data.Sampler):
                 # We don't know the direct count without more work, so we'll estimate it here for multi-GPU training.
                 total_image_count *= self.accelerator.num_processes
                 total_image_count = f"~{total_image_count}"
+            data_backend_config = StateTracker.get_data_backend_config(self.id)
             printed_state = (
-                f"- Repeats: {StateTracker.get_data_backend_config(self.id).get('repeats', 0)}\n"
+                f"- Repeats: {data_backend_config.get('repeats', 0)}\n"
                 f"- Total number of images: {total_image_count}\n"
                 f"- Total number of aspect buckets: {len(self.buckets)}\n"
                 f"- Resolution: {self.resolution} {'megapixels' if self.resolution_type == 'area' else 'px'}\n"
-                f"- Cropped: {StateTracker.get_data_backend_config(self.id).get('crop')}\n"
-                f"- Crop style: {'None' if not StateTracker.get_data_backend_config(self.id).get('crop') else StateTracker.get_data_backend_config(self.id).get('crop_style')}\n"
-                f"- Crop aspect: {'None' if not StateTracker.get_data_backend_config(self.id).get('crop') else StateTracker.get_data_backend_config(self.id).get('crop_aspect')}\n"
+                f"- Cropped: {data_backend_config.get('crop')}\n"
+                f"- Crop style: {'None' if not data_backend_config.get('crop') else data_backend_config.get('crop_style')}\n"
+                f"- Crop aspect: {'None' if not data_backend_config.get('crop') else data_backend_config.get('crop_aspect')}\n"
+                f"- Used for regularisation data: {'Yes' if self.is_regularisation_data else 'No'}\n"
             )
+            if self.conditioning_type:
+                printed_state += f"- Conditioning type: {self.conditioning_type}\n"
         else:
             # Return a snapshot of the current state during training.
             printed_state = (
@@ -446,19 +460,30 @@ class MultiAspectSampler(torch.utils.data.Sampler):
         full_path = os.path.join(
             self.metadata_backend.instance_data_dir, original_sample_path
         )
+        try:
+            conditioning_sample_data = self.data_backend.read_image(full_path)
+        except Exception as e:
+            self.logger.error(f"Could not fetch conditioning sample: {e}")
+
+            return None
+        if not conditioning_sample_data:
+            self.debug_log(f"Could not fetch conditioning sample from {full_path}.")
+            return None
+
         conditioning_sample = TrainingSample(
-            image=self.data_backend.read_image(full_path),
+            image=conditioning_sample_data,
             data_backend_id=self.id,
             image_metadata=self.metadata_backend.get_metadata_by_filepath(full_path),
             image_path=full_path,
+            conditioning_type=self.conditioning_type,
         )
         return conditioning_sample
 
     def connect_conditioning_samples(self, samples: tuple):
-        if not StateTracker.get_args().controlnet:
-            return samples
         # Locate the conditioning data
         conditioning_dataset = StateTracker.get_conditioning_dataset(self.id)
+        if conditioning_dataset is None:
+            return samples
         sampler = conditioning_dataset["sampler"]
         outputs = list(samples)
         for sample in samples:
@@ -540,6 +565,7 @@ class MultiAspectSampler(torch.utils.data.Sampler):
                         [instance["image_path"] for instance in final_yield]
                     )
                     self.accelerator.wait_for_everyone()
+                    # if applicable, we'll append TrainingSample(s) to the end for conditioning inputs.
                     final_yield = self.connect_conditioning_samples(final_yield)
                     yield tuple(final_yield)
                     # Change bucket after a full batch is yielded

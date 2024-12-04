@@ -25,13 +25,17 @@ def safety_check(args, accelerator):
                 args.base_model_precision = "int8-quanto"
 
     if (
-        (args.base_model_precision in ["fp8-quanto", "int4-quanto"] or (args.base_model_precision != "no_change" and args.quantize_activations))
-        and (accelerator is not None and accelerator.state.dynamo_plugin.backend.lower() == "inductor")
+        args.base_model_precision in ["fp8-quanto", "int4-quanto"]
+        or (args.base_model_precision != "no_change" and args.quantize_activations)
+    ) and (
+        accelerator is not None
+        and accelerator.state.dynamo_plugin.backend.lower() == "inductor"
     ):
         logger.warning(
             f"{args.base_model_precision} is not supported with Dynamo backend. Disabling Dynamo."
         )
         from accelerate.utils import DynamoBackend
+
         accelerator.state.dynamo_plugin.backend = DynamoBackend.NO
     if args.report_to == "wandb":
         if not is_wandb_available():
@@ -92,3 +96,58 @@ def safety_check(args, accelerator):
                 f"Your GPU has {total_memory_gb}GB of memory. The SOAP optimiser requires a GPU with at least 24G of memory."
             )
             sys.exit(1)
+
+    if (
+        args.model_type != "lora"
+        and not args.controlnet
+        and args.base_model_precision != "no_change"
+        and not args.i_know_what_i_am_doing
+    ):
+        logger.error(
+            f"{args.model_type} tuning is not compatible with quantisation. Please set --base_model_precision to 'no_change' or train LyCORIS/LoRA."
+        )
+        sys.exit(1)
+
+    if (
+        args.flux_schedule_shift is not None
+        and args.flux_schedule_shift > 0
+        and args.flux_schedule_auto_shift
+    ):
+        logger.error(
+            f"--flux_schedule_auto_shift cannot be combined with --flux_schedule_shift. Please set --flux_schedule_shift to 0 if you want to train with --flux_schedule_auto_shift."
+        )
+        sys.exit(1)
+
+    if args.attention_mechanism == "sageattention":
+        if args.sageattention_usage != "inference":
+            logger.error(
+                f"SageAttention usage is set to '{args.sageattention_usage}' instead of 'inference'. This is not an officially supported configuration, please be sure you understand the implications. It is recommended to set this value to 'inference' for safety."
+            )
+        if args.enable_xformers_memory_efficient_attention:
+            logger.error(
+                f"--enable_xformers_memory_efficient_attention is only compatible with --attention_mechanism=diffusers. Please set --attention_mechanism=diffusers to enable this feature or disable xformers to use alternative attention mechanisms."
+            )
+            sys.exit(1)
+        if "nf4" in args.base_model_precision:
+            logger.error(
+                f"{args.base_model_precision} is not supported with SageAttention. Please select from int8 or fp8, or, disable quantisation to use SageAttention."
+            )
+            sys.exit(1)
+
+    gradient_checkpointing_interval_supported_models = [
+        "flux",
+        "sdxl",
+    ]
+    if args.gradient_checkpointing_interval is not None:
+        if (
+            args.model_family.lower()
+            not in gradient_checkpointing_interval_supported_models
+        ):
+            logger.error(
+                f"Gradient checkpointing is not supported with {args.model_family} models. Please disable --gradient_checkpointing_interval by setting it to None, or remove it from your configuration. Currently supported models: {gradient_checkpointing_interval_supported_models}"
+            )
+            sys.exit(1)
+        if args.gradient_checkpointing_interval == 0:
+            raise ValueError(
+                "Gradient checkpointing interval must be greater than 0. Please set it to a positive integer."
+            )

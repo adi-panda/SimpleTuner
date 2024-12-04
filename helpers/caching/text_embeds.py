@@ -30,6 +30,7 @@ def _encode_sd3_prompt_with_t5(
     num_images_per_prompt=1,
     device=None,
     zero_padding_tokens: bool = True,
+    max_sequence_length: int = 77,
 ):
     prompt = [prompt] if isinstance(prompt, str) else prompt
     batch_size = len(prompt)
@@ -37,7 +38,7 @@ def _encode_sd3_prompt_with_t5(
     text_inputs = tokenizer(
         prompt,
         padding="max_length",
-        max_length=77,
+        max_length=max_sequence_length,
         truncation=True,
         add_special_tokens=True,
         return_tensors="pt",
@@ -207,7 +208,12 @@ class TextEmbeddingCache(WebhookMixin):
 
     def save_to_cache(self, filename, embeddings):
         """Add write requests to the queue instead of writing directly."""
-        self.process_write_batches = True
+        if not self.batch_write_thread.is_alive():
+            logger.debug("Restarting background write thread.")
+            # Start the thread again.
+            self.process_write_batches = True
+            self.batch_write_thread = Thread(target=self.batch_write_embeddings)
+            self.batch_write_thread.start()
         self.write_queue.put((embeddings, filename))
         logger.debug(
             f"save_to_cache called for {filename}, write queue has {self.write_queue.qsize()} items, and the write thread's status: {self.batch_write_thread.is_alive()}"
@@ -215,6 +221,8 @@ class TextEmbeddingCache(WebhookMixin):
 
     def batch_write_embeddings(self):
         """Process write requests in batches."""
+        batch = []
+        written_elements = 0
         while True:
             try:
                 # Block until an item is available or timeout occurs
@@ -225,14 +233,29 @@ class TextEmbeddingCache(WebhookMixin):
                 while (
                     not self.write_queue.empty() and len(batch) < self.write_batch_size
                 ):
+                    logger.debug("Retrieving more items from the queue.")
                     items = self.write_queue.get_nowait()
                     batch.append(items)
+                    logger.debug(f"Batch now contains {len(batch)} items.")
 
                 self.process_write_batch(batch)
                 self.write_thread_bar.update(len(batch))
+                logger.debug("Processed batch write.")
+                written_elements += len(batch)
 
             except queue.Empty:
                 # Timeout occurred, no items were ready
+                if not self.process_write_batches:
+                    if len(batch) > 0:
+                        self.process_write_batch(batch)
+                        self.write_thread_bar.update(len(batch))
+                    logger.debug(
+                        f"Exiting batch write thread, no more work to do after writing {written_elements} elements"
+                    )
+                    break
+                logger.debug(
+                    f"Queue is empty. Retrieving new entries. Should retrieve? {self.process_write_batches}"
+                )
                 pass
             except Exception:
                 logger.exception("An error occurred while writing embeddings to disk.")
@@ -241,6 +264,7 @@ class TextEmbeddingCache(WebhookMixin):
     def process_write_batch(self, batch):
         """Write a batch of embeddings to the cache."""
         logger.debug(f"Writing {len(batch)} items to disk")
+        logger.debug(f"Batch: {batch}")
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = [
                 executor.submit(self.data_backend.torch_save, *args) for args in batch
@@ -307,7 +331,7 @@ class TextEmbeddingCache(WebhookMixin):
         tokenizers,
         prompt: str,
         is_validation: bool = False,
-        zero_padding_tokens: bool = True,
+        zero_padding_tokens: bool = False,
     ):
         """
         Encode a prompt for an SD3 model.
@@ -351,6 +375,7 @@ class TextEmbeddingCache(WebhookMixin):
             num_images_per_prompt=num_images_per_prompt,
             device=self.accelerator.device,
             zero_padding_tokens=zero_padding_tokens,
+            max_sequence_length=StateTracker.get_args().tokenizer_max_length,
         )
 
         clip_prompt_embeds = torch.nn.functional.pad(
@@ -504,9 +529,7 @@ class TextEmbeddingCache(WebhookMixin):
                 prompt,
                 is_validation,
                 zero_padding_tokens=(
-                    True
-                    if StateTracker.get_args().sd3_t5_mask_behaviour == "mask"
-                    else False
+                    True if StateTracker.get_args().t5_padding == "zero" else False
                 ),
             )
         else:
@@ -1299,21 +1322,30 @@ class TextEmbeddingCache(WebhookMixin):
                         )
                 if should_encode:
                     # If load_from_cache is True, should_encode would be False unless we failed to load.
-                    self.debug_log(f"Encoding prompt: {prompt}")
+                    self.debug_log(
+                        f"Encoding filename {filename} :: device {self.text_encoders[0].device} :: prompt {prompt}"
+                    )
                     prompt_embeds, pooled_prompt_embeds = self.encode_sd3_prompt(
                         self.text_encoders,
                         self.tokenizers,
                         [prompt],
                         is_validation,
+                        zero_padding_tokens=(
+                            True
+                            if StateTracker.get_args().t5_padding == "zero"
+                            else False
+                        ),
                     )
                     logger.debug(
-                        f"SD3 prompt embeds: {prompt_embeds.shape}, {pooled_prompt_embeds.shape}"
+                        f"Filename {filename} SD3 prompt embeds: {prompt_embeds.shape}, {pooled_prompt_embeds.shape}"
                     )
                     add_text_embeds = pooled_prompt_embeds
                     # StabilityAI say not to zero them out.
-                    # if prompt == "":
-                    #     prompt_embeds = torch.zeros_like(prompt_embeds)
-                    #     add_text_embeds = torch.zeros_like(add_text_embeds)
+                    if prompt == "":
+                        if StateTracker.get_args().sd3_clip_uncond_behaviour == "zero":
+                            prompt_embeds = torch.zeros_like(prompt_embeds)
+                        if StateTracker.get_args().sd3_t5_uncond_behaviour == "zero":
+                            add_text_embeds = torch.zeros_like(add_text_embeds)
                     # Get the current size of the queue.
                     current_size = self.write_queue.qsize()
                     if current_size >= 2048:

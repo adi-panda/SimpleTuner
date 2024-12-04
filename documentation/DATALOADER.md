@@ -47,8 +47,8 @@ Here is the most basic example of a dataloader configuration file, as `multidata
 
 ### `dataset_type`
 
-- **Values:** `image` | `text_embeds` | `image_embeds`
-- **Description:** `image` datasets contain your training data. `text_embeds` contain the outputs of the text encoder cache, and `image_embeds` contain the VAE outputs, if the model uses one.
+- **Values:** `image` | `text_embeds` | `image_embeds` | `conditioning`
+- **Description:** `image` datasets contain your training data. `text_embeds` contain the outputs of the text encoder cache, and `image_embeds` contain the VAE outputs, if the model uses one. When a dataset is marked as `conditioning`, it is possible to pair it to your `image` dataset via [the conditioning_data option](#conditioning_data)
 - **Note:** Text and image embed datasets are defined differently than image datasets are. A text embed dataset stores ONLY the text embed objects. An image dataset stores the training data.
 
 ### `default`
@@ -70,6 +70,16 @@ Here is the most basic example of a dataloader configuration file, as `multidata
 
 - **Values:** `aws` | `local` | `csv`
 - **Description:** Determines the storage backend (local, csv or cloud) used for this dataset.
+
+### `conditioning_type`
+
+- **Values:** `controlnet` | `mask`
+- **Description:** A dataset may contain ControlNet conditioning inputs or masks to use during loss calculations. Only one or the other may be used.
+
+### `conditioning_data`
+
+- **Values:** `id` value of conditioning dataset
+- **Description:** As described in [the ControlNet guide](/documentation/CONTROLNET.md), an `image` dataset can be paired to its ControlNet or image mask data via this option.
 
 ### `instance_data_dir` / `aws_data_prefix`
 
@@ -189,6 +199,12 @@ Images are not resized before cropping **unless** `maximum_image_size` and `targ
 
 > ℹ️ This value behaves differently to the same option in Kohya's scripts, where a value of 1 means no repeats. **For SimpleTuner, a value of 0 means no repeats**. Subtract one from your Kohya config value to obtain the equivalent for SimpleTuner, hence a value of **9** resulting from the calculation `(dataset_length + repeats * dataset_length)` .
 
+### `is_regularisation_data`
+
+- Also may be spelt `is_regularization_data`
+- Enables parent-teacher training for LyCORIS adapters so that the prediction target prefers the base model's result for a given dataset.
+  - Standard LoRA are not currently supported.
+
 ### `vae_cache_clear_each_epoch`
 
 - When enabled, all VAE cache objects are deleted from the filesystem at the end of each dataset repeat cycle. This can be resource-intensive for large datasets, but combined with `crop_style=random` and/or `crop_aspect=random` you'll want this enabled to ensure you sample a full range of crops from each image.
@@ -223,7 +239,7 @@ Images are not resized before cropping **unless** `maximum_image_size` and `targ
 
 #### Example filter list
 
-A complete example list can be found [here](/caption_filter_list.example.txt). It contains common repetitive and negative strings that would be returned by BLIP (all common variety), LLaVA, and CogVLM.
+A complete example list can be found [here](/config/caption_filter_list.txt.example). It contains common repetitive and negative strings that would be returned by BLIP (all common variety), LLaVA, and CogVLM.
 
 This is a shortened example, which will be explained below:
 

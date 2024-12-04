@@ -9,12 +9,12 @@ package-mode = false
 
 [tool.poetry.dependencies]
 python = ">=3.10,<3.12"
-torch = { version = ">2.5.0", source = "pytorch-nightly" }
-torchvision = { version = ">0.19", source = "pytorch-nightly" }
-diffusers = "^0.30.3"
+torch = {version = "^2.4.1+cu124", source = "pytorch"}
+torchvision = {version = "^0.19.0+cu124", source = "pytorch"}
+diffusers = "^0.31.0"
 transformers = "^4.45.1"
 datasets = "^3.0.1"
-bitsandbytes = { version = "^0.43.3" }
+bitsandbytes = "^0.44.1"
 wandb = "^0.18.2"
 requests = "^2.32.3"
 pillow = "^10.4.0"
@@ -32,7 +32,7 @@ pandas = "^2.2.3"
 botocore = "^1.35.24"
 urllib3 = "<1.27"
 torchaudio = "^2.4.1"
-triton-library = "^1.0.0rc2"
+triton-library = "^1.0.0rc4"
 torchsde = "^0.2.5"
 torchmetrics = "^1.1.1"
 colorama = "^0.4.6"
@@ -48,7 +48,9 @@ toml = "^0.10.2"
 fastapi = {extras = ["standard"], version = "^0.115.0"}
 torchao = {version = "^0.5.0+cu124", source = "pytorch"}
 lm-eval = "^0.4.4"
-nvidia-cudnn-cu12 = "^9.4.0.58"
+nvidia-cudnn-cu12 = "*"
+nvidia-nccl-cu12 = "*"
+
 
 
 [build-system]
@@ -59,8 +61,3 @@ build-backend = "poetry.core.masonry.api"
 priority = "supplemental"
 name = "pytorch"
 url = "https://download.pytorch.org/whl/cu124"
-
-[[tool.poetry.source]]
-priority = "supplemental"
-name = "pytorch-nightly"
-url = "https://download.pytorch.org/whl/nightly/cu124"

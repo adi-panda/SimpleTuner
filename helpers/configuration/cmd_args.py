@@ -6,6 +6,7 @@ import os
 from typing import Dict, List, Optional, Tuple
 import random
 import time
+import json
 import logging
 import sys
 import torch
@@ -149,9 +150,38 @@ def get_argument_parser():
         ),
     )
     parser.add_argument(
+        "--flux_use_uniform_schedule",
+        action="store_true",
+        help=(
+            "Whether or not to use a uniform schedule with Flux instead of sigmoid."
+            " Using uniform sampling may help preserve more capabilities from the base model."
+            " Some tasks may not benefit from this."
+        ),
+    )
+    parser.add_argument(
+        "--flux_use_beta_schedule",
+        action="store_true",
+        help=(
+            "Whether or not to use a beta schedule with Flux instead of sigmoid. The default values of alpha"
+            " and beta approximate a sigmoid."
+        ),
+    )
+    parser.add_argument(
+        "--flux_beta_schedule_alpha",
+        type=float,
+        default=2.0,
+        help=("The alpha value of the flux beta schedule. Default is 2.0"),
+    )
+    parser.add_argument(
+        "--flux_beta_schedule_beta",
+        type=float,
+        default=2.0,
+        help=("The beta value of the flux beta schedule. Default is 2.0"),
+    )
+    parser.add_argument(
         "--flux_schedule_shift",
         type=float,
-        default=None,
+        default=3,
         help=(
             "Shift the noise schedule. This is a value between 0 and ~4.0, where 0 disables the timestep-dependent shift,"
             " and anything greater than 0 will shift the timestep sampling accordingly. The SD3 model was trained with"
@@ -243,28 +273,34 @@ def get_argument_parser():
     parser.add_argument(
         "--flow_matching_loss",
         type=str,
-        choices=["diffusers", "compatible", "diffusion"],
+        choices=["diffusers", "compatible", "diffusion", "sd35"],
         default="compatible",
         help=(
             "A discrepancy exists between the Diffusers implementation of flow matching and the minimal implementation provided"
             " by StabilityAI. This experimental option allows switching loss calculations to be compatible with those."
             " Additionally, 'diffusion' is offered as an option to reparameterise a model to v_prediction loss."
+            " sd35 provides the ability to train on SD3.5's flow-matching target, which is the denoised sample."
         ),
     )
     parser.add_argument(
-        "--sd3_t5_mask_behaviour",
+        "--sd3_clip_uncond_behaviour",
         type=str,
-        choices=["do-nothing", "mask"],
-        default="mask",
+        choices=["empty_string", "zero"],
+        default="empty_string",
         help=(
-            "StabilityAI did not correctly implement their attention masking on T5 inputs for SD3 Medium."
-            " This option enables you to switch between their broken implementation or the corrected mask"
-            " implementation. Although, the corrected masking is still applied via hackish workaround,"
-            " manually applying the mask to the prompt embeds so that the padded positions are zero."
-            " This improves the results for short captions, but does not change the behaviour for long captions."
-            " It is important to note that this limitation currently prevents expansion of SD3 Medium's"
-            " prompt length, as it will unnecessarily attend to every token in the prompt embed,"
-            " even masked positions."
+            "SD3 can be trained using zeroed prompt embeds during unconditional dropout,"
+            " or an encoded empty string may be used instead (the default). Changing this value may stabilise or"
+            " destabilise training. The default is 'empty_string'."
+        ),
+    )
+    parser.add_argument(
+        "--sd3_t5_uncond_behaviour",
+        type=str,
+        choices=["empty_string", "zero"],
+        default=None,
+        help=(
+            "Override the value of unconditional prompts from T5 embeds."
+            " The default is to follow the value of --sd3_clip_uncond_behaviour."
         ),
     )
     parser.add_argument(
@@ -554,6 +590,15 @@ def get_argument_parser():
         help=(
             "When pre-caching latent vectors, this is the batch size to use. Decreasing this may help with VRAM issues,"
             " but if you are at that point of contention, it's possible that your GPU has too little RAM. Default: 4."
+        ),
+    )
+    parser.add_argument(
+        "--vae_enable_tiling",
+        action="store_true",
+        default=False,
+        help=(
+            "If set, will enable tiling for VAE caching. This is useful for very large images when VRAM is limited."
+            " This may be required for 2048px VAE caching on 24G accelerators, in addition to reducing --vae_batch_size."
         ),
     )
     parser.add_argument(
@@ -1010,6 +1055,15 @@ def get_argument_parser():
         help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",
     )
     parser.add_argument(
+        "--gradient_checkpointing_interval",
+        default=None,
+        type=int,
+        help=(
+            "Some models (Flux, SDXL, SD1.x/2.x) can have their gradient checkpointing limited to every nth block."
+            " This can speed up training but will use more memory with larger intervals."
+        ),
+    )
+    parser.add_argument(
         "--learning_rate",
         type=float,
         default=4e-7,
@@ -1066,7 +1120,7 @@ def get_argument_parser():
     parser.add_argument(
         "--use_ema",
         action="store_true",
-        help="Whether to use EMA (exponential moving average) model.",
+        help="Whether to use EMA (exponential moving average) model. Works with LoRA, Lycoris, and full training.",
     )
     parser.add_argument(
         "--ema_device",
@@ -1075,6 +1129,17 @@ def get_argument_parser():
         help=(
             "The device to use for the EMA model. If set to 'accelerator', the EMA model will be placed on the accelerator."
             " This provides the fastest EMA update times, but is not ultimately necessary for EMA to function."
+        ),
+    )
+    parser.add_argument(
+        "--ema_validation",
+        choices=["none", "ema_only", "comparison"],
+        default="comparison",
+        help=(
+            "When 'none' is set, no EMA validation will be done."
+            " When using 'ema_only', the validations will rely mostly on the EMA weights."
+            " When using 'comparison' (default) mode, the validations will first run on the checkpoint before also running for"
+            " the EMA weights. In comparison mode, the resulting images will be provided side-by-side."
         ),
     )
     parser.add_argument(
@@ -1286,6 +1351,26 @@ def get_argument_parser():
         ),
     )
     parser.add_argument(
+        "--evaluation_type",
+        type=str,
+        default=None,
+        choices=["clip", "none"],
+        help=(
+            "Validations must be enabled for model evaluation to function. The default is to use no evaluator,"
+            " and 'clip' will use a CLIP model to evaluate the resulting model's performance during validations."
+        ),
+    )
+    parser.add_argument(
+        "--pretrained_evaluation_model_name_or_path",
+        type=str,
+        default="openai/clip-vit-large-patch14-336",
+        help=(
+            "Optionally provide a custom model to use for ViT evaluations."
+            " The default is currently clip-vit-large-patch14-336, allowing for lower patch sizes (greater accuracy)"
+            " and an input resolution of 336x336."
+        ),
+    )
+    parser.add_argument(
         "--validation_on_startup",
         action="store_true",
         default=False,
@@ -1302,6 +1387,15 @@ def get_argument_parser():
             "Some systems may benefit from using CPU-based seeds for reproducibility. On other systems, this may cause a TypeError."
             " Setting this option to 'cpu' may cause validation errors. If so, please set SIMPLETUNER_LOG_LEVEL=DEBUG"
             " and submit debug.log to a new Github issue report."
+        ),
+    )
+    parser.add_argument(
+        "--validation_lycoris_strength",
+        type=float,
+        default=1.0,
+        help=(
+            "When inferencing for validations, the Lycoris model will by default be run at its training strength, 1.0."
+            " However, this value can be increased to a value of around 1.3 or 1.5 to get a stronger effect from the model."
         ),
     )
     parser.add_argument(
@@ -1324,6 +1418,37 @@ def get_argument_parser():
             " the default mode, provides the most benefit."
         ),
     )
+    parser.add_argument(
+        "--validation_guidance_skip_layers",
+        type=str,
+        default=None,
+        help=(
+            "StabilityAI recommends a value of [7, 8, 9] for Stable Diffusion 3.5 Medium."
+        ),
+    )
+    parser.add_argument(
+        "--validation_guidance_skip_layers_start",
+        type=float,
+        default=0.01,
+        help=("StabilityAI recommends a value of 0.01 for SLG start."),
+    )
+    parser.add_argument(
+        "--validation_guidance_skip_layers_stop",
+        type=float,
+        default=0.01,
+        help=("StabilityAI recommends a value of 0.2 for SLG start."),
+    )
+    parser.add_argument(
+        "--validation_guidance_skip_scale",
+        type=float,
+        default=2.8,
+        help=(
+            "StabilityAI recommends a value of 2.8 for SLG guidance skip scaling."
+            " When adding more layers, you must increase the scale, eg. adding one more layer requires doubling"
+            " the value given."
+        ),
+    )
+
     parser.add_argument(
         "--allow_tf32",
         action="store_true",
@@ -1593,9 +1718,42 @@ def get_argument_parser():
         help="For distributed training: local_rank",
     )
     parser.add_argument(
+        "--attention_mechanism",
+        type=str,
+        choices=[
+            "diffusers",
+            "xformers",
+            "sageattention",
+            "sageattention-int8-fp16-triton",
+            "sageattention-int8-fp16-cuda",
+            "sageattention-int8-fp8-cuda",
+        ],
+        default="diffusers",
+        help=(
+            "On NVIDIA CUDA devices, alternative flash attention implementations are offered, with the default being native pytorch SDPA."
+            " SageAttention has multiple backends to select from."
+            " The recommended value, 'sageattention', guesses what would be the 'best' option for SageAttention on your hardware"
+            " (usually this is the int8-fp16-cuda backend). However, manually setting this value to int8-fp16-triton"
+            " may provide better averages for per-step training and inference performance while the cuda backend"
+            " may provide the highest maximum speed (with also a lower minimum speed). NOTE: SageAttention training quality"
+            " has not been validated."
+        ),
+    )
+    parser.add_argument(
+        "--sageattention_usage",
+        type=str,
+        choices=["training", "inference", "training+inference"],
+        default="inference",
+        help=(
+            "SageAttention breaks gradient tracking through the backward pass, leading to untrained QKV layers."
+            " This can result in substantial problems for training, so it is recommended to use SageAttention only for inference (default behaviour)."
+            " If you are confident in your training setup or do not wish to train QKV layers, you may use 'training' to enable SageAttention for training."
+        ),
+    )
+    parser.add_argument(
         "--enable_xformers_memory_efficient_attention",
         action="store_true",
-        help="Whether or not to use xformers.",
+        help="Whether or not to use xformers. Deprecated and slated for future removal. Use --attention_mechanism.",
     )
     parser.add_argument(
         "--set_grads_to_none",
@@ -2053,7 +2211,7 @@ def parse_cmdline_args(input_args=None):
 
     if (
         args.pretrained_vae_model_name_or_path is not None
-        and args.model_family in ["legacy", "flux"]
+        and args.model_family in ["legacy", "flux", "sd3"]
         and "sdxl" in args.pretrained_vae_model_name_or_path
         and "deepfloyd" not in args.model_type
     ):
@@ -2078,6 +2236,12 @@ def parse_cmdline_args(input_args=None):
             "MM-DiT requires an alignment value of 64px. Overriding the value of --aspect_bucket_alignment."
         )
         args.aspect_bucket_alignment = 64
+        if args.sd3_t5_uncond_behaviour is None:
+            args.sd3_t5_uncond_behaviour = args.sd3_clip_uncond_behaviour
+        info_log(
+            f"SD3 embeds for unconditional captions: t5={args.sd3_t5_uncond_behaviour}, clip={args.sd3_clip_uncond_behaviour}"
+        )
+
     elif "deepfloyd" in args.model_type:
         deepfloyd_pixel_alignment = 8
         if args.aspect_bucket_alignment != deepfloyd_pixel_alignment:
@@ -2136,7 +2300,7 @@ def parse_cmdline_args(input_args=None):
         args.pretrained_vae_model_name_or_path = None
         args.disable_compel = True
 
-    t5_max_length = 77
+    t5_max_length = 256
     if args.model_family == "sd3" and (
         args.tokenizer_max_length is None
         or int(args.tokenizer_max_length) > t5_max_length
@@ -2159,8 +2323,10 @@ def parse_cmdline_args(input_args=None):
         "schnell" in args.pretrained_model_name_or_path.lower()
         or args.flux_fast_schedule
     ):
-        if not args.flux_fast_schedule:
-            error_log("Schnell requires --flux_fast_schedule.")
+        if not args.flux_fast_schedule and not args.i_know_what_i_am_doing:
+            error_log(
+                "Schnell requires --flux_fast_schedule (or --i_know_what_i_am_doing)."
+            )
             sys.exit(1)
         flux_version = "schnell"
         model_max_seq_length = 256
@@ -2222,7 +2388,9 @@ def parse_cmdline_args(input_args=None):
                     f"{'PixArt Sigma' if args.model_family == 'pixart_sigma' else 'Stable Diffusion 3'} requires --max_grad_norm=0.01 to prevent model collapse. Overriding value. Set this value manually to disable this warning."
                 )
                 args.max_grad_norm = 0.01
-
+    if args.gradient_checkpointing:
+        # enable torch compile w/ activation checkpointing :[ slows us down.
+        torch._dynamo.config.optimize_ddp = False
     if args.gradient_accumulation_steps > 1:
         if args.gradient_precision == "unmodified" or args.gradient_precision is None:
             warning_log(
@@ -2236,13 +2404,9 @@ def parse_cmdline_args(input_args=None):
             )
             args.gradient_precision = "fp32"
 
-    if args.use_ema:
-        if args.model_family == "sd3":
-            raise ValueError(
-                "Using EMA is not currently supported for Stable Diffusion 3 training."
-            )
-        if "lora" in args.model_type:
-            raise ValueError("Using EMA is not currently supported for LoRA training.")
+    # if args.use_ema:
+    #     if "lora" in args.model_type:
+    #         raise ValueError("Using EMA is not currently supported for LoRA training.")
     args.logging_dir = os.path.join(args.output_dir, args.logging_dir)
     args.accelerator_project_config = ProjectConfiguration(
         project_dir=args.output_dir, logging_dir=args.logging_dir
@@ -2296,7 +2460,7 @@ def parse_cmdline_args(input_args=None):
             args.lycoris_config, os.R_OK
         ):
             raise ValueError(
-                f"Could not find the JSON configuration file at {args.lycoris_config}"
+                f"Could not find the JSON configuration file at '{args.lycoris_config}'"
             )
         import json
 
@@ -2316,11 +2480,11 @@ def parse_cmdline_args(input_args=None):
     elif "standard" == args.lora_type.lower():
         if hasattr(args, "lora_init_type") and args.lora_init_type is not None:
             if torch.backends.mps.is_available() and args.lora_init_type == "loftq":
-                logger.error(
+                error_log(
                     "Apple MPS cannot make use of LoftQ initialisation. Overriding to 'default'."
                 )
             elif args.is_quantized and args.lora_init_type == "loftq":
-                logger.error(
+                error_log(
                     "LoftQ initialisation is not supported with quantised models. Overriding to 'default'."
                 )
             else:
@@ -2329,7 +2493,7 @@ def parse_cmdline_args(input_args=None):
                 )
         if args.use_dora:
             if "quanto" in args.base_model_precision:
-                logger.error(
+                error_log(
                     "Quanto does not yet support DoRA training in PEFT. Disabling DoRA. 😴"
                 )
                 args.use_dora = False
@@ -2353,6 +2517,29 @@ def parse_cmdline_args(input_args=None):
     if args.gradient_accumulation_steps < 1:
         raise ValueError(
             f"Invalid gradient_accumulation_steps parameter: {args.gradient_accumulation_steps}, should be >= 1"
+        )
+
+    if args.validation_guidance_skip_layers is not None:
+        try:
+            import json
+
+            args.validation_guidance_skip_layers = json.loads(
+                args.validation_guidance_skip_layers
+            )
+        except Exception as e:
+            logger.error(f"Could not load skip layers: {e}")
+            raise
+
+    if args.enable_xformers_memory_efficient_attention:
+        if args.attention_mechanism != "xformers":
+            warning_log(
+                "The option --enable_xformers_memory_efficient_attention is deprecated. Please use --attention_mechanism=xformers instead."
+            )
+            args.attention_mechanism = "xformers"
+
+    if args.attention_mechanism != "diffusers" and not torch.cuda.is_available():
+        warning_log(
+            "For non-CUDA systems, only Diffusers attention mechanism is officially supported."
         )
 
     return args

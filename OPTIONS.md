@@ -40,6 +40,15 @@ The script `configure.py` in the project root can be used via `python configure.
 - **What**: Path to the pretrained T5 model or its identifier from https://huggingface.co/models.
 - **Why**: When training PixArt, you might want to use a specific source for your T5 weights so that you can avoid downloading them multiple times when switching the base model you train from.
 
+### `--gradient_checkpointing`
+
+- **What**: During training, gradients will be calculated layerwise and accumulated to save on peak VRAM requirements at the cost of slower training.
+
+### `--gradient_checkpointing_interval`
+
+- **What**: Checkpoint only every _n_ blocks, where _n_ is a value greater than zero. A value of 1 is effectively the same as just leaving `--gradient_checkpointing` enabled, and a value of 2 will checkpoint every other block.
+- **Note**: SDXL and Flux are currently the only models supporting this option. SDXL uses a hackish implementation.
+
 ### `--refiner_training`
 
 - **What**: Enables training a custom mixture-of-experts model series. See [Mixture-of-Experts](/documentation/MIXTURE_OF_EXPERTS.md) for more information on these options.
@@ -84,7 +93,13 @@ A newer library from Pytorch, AO allows us to replace the linears and 2D convolu
   - at the time of writing, runs slightly slower (11s/iter) than Quanto does (9s/iter) on Apple MPS
   - When not using `torch.compile`, same speed and memory use as `int8-quanto` on CUDA devices, unknown speed profile on ROCm
   - When using `torch.compile`, slower than `int8-quanto`
-- `fp8-torchao` is not enabled due to bugs in the implementation.
+- `fp8-torchao` is only available for Hopper (H100, H200) or newer (Blackwell B200) accelerators
+
+##### Optimisers
+
+TorchAO includes generally-available 4bit and 8bit optimisers: `ao-adamw8bit`, `ao-adamw4bit`
+
+It also provides two optimisers that are directed toward Hopper (H100 or better) users: `ao-adamfp8`, and `ao-adamwfp8`
 
 #### Torch Dynamo
 
@@ -102,6 +117,18 @@ accelerate config
 Carefully answer the questions and use bf16 mixed precision training when prompted. Say **yes** to using Dynamo, **no** to fullgraph, and **yes** to max-autotune.
 
 Note that the first several steps of training will be slower than usual because of compilation occuring in the background.
+
+### `--attention_mechanism`
+
+Alternative attention mechanisms are supported, with varying levels of compatibility or other trade-offs;
+
+- `diffusers` uses the native Pytorch SDPA functions and is the default attention mechanism
+- `xformers` allows the use of Meta's [xformers](https://github.com/facebook/xformers) attention implementation which supports both training and inference fully
+- `sageattention` is an inference-focused attention mechanism which does not fully support being used for training ([SageAttention](https://github.com/thu-ml/SageAttention) project page)
+  - In simplest terms, SageAttention reduces compute requirement for inference
+
+Using `--sageattention_usage` to enable training with SageAttention should be enabled with care, as it does not track or propagate gradients from its custom CUDA implementations for the QKV linears.
+  - This results in these layers being completely untrained, which might cause model collapse or, slight improvements in short training runs.
 
 ---
 
@@ -197,6 +224,11 @@ A lot of settings are instead set through the [dataloader config](/documentation
 - **What**: Output image resolution, measured in pixels, or, formatted as: `widthxheight`, as in `1024x1024`. Multiple resolutions can be defined, separated by commas.
 - **Why**: All images generated during validation will be this resolution. Useful if the model is being trained with a different resolution.
 
+### `--evaluation_type`
+
+- **What**: Enable CLIP evaluation of generated images during validations.
+- **Why**: CLIP scores calculate the distance of the generated image features to the provided validation prompt. This can give an idea of whether prompt adherence is improving, though it requires a large number of validation prompts to have any meaningful value.
+- **Options**: "none" or "clip"
 
 ### `--crop`
 
@@ -350,7 +382,10 @@ usage: train.py [-h] [--snr_gamma SNR_GAMMA] [--use_soft_min_snr]
                 [--model_type {full,lora,deepfloyd-full,deepfloyd-lora,deepfloyd-stage2,deepfloyd-stage2-lora}]
                 [--flux_lora_target {mmdit,context,context+ffs,all,all+ffs,ai-toolkit,tiny,nano}]
                 [--flow_matching_sigmoid_scale FLOW_MATCHING_SIGMOID_SCALE]
-                [--flux_fast_schedule]
+                [--flux_fast_schedule] [--flux_use_uniform_schedule]
+                [--flux_use_beta_schedule]
+                [--flux_beta_schedule_alpha FLUX_BETA_SCHEDULE_ALPHA]
+                [--flux_beta_schedule_beta FLUX_BETA_SCHEDULE_BETA]
                 [--flux_schedule_shift FLUX_SCHEDULE_SHIFT]
                 [--flux_schedule_auto_shift]
                 [--flux_guidance_mode {constant,random-range,mobius}]
@@ -360,8 +395,9 @@ usage: train.py [-h] [--snr_gamma SNR_GAMMA] [--use_soft_min_snr]
                 [--flux_attention_masked_training]
                 [--t5_padding {zero,unmodified}] [--smoldit]
                 [--smoldit_config {smoldit-small,smoldit-swiglu,smoldit-base,smoldit-large,smoldit-huge}]
-                [--flow_matching_loss {diffusers,compatible,diffusion}]
-                [--sd3_t5_mask_behaviour {do-nothing,mask}]
+                [--flow_matching_loss {diffusers,compatible,diffusion,sd35}]
+                [--sd3_clip_uncond_behaviour {empty_string,zero}]
+                [--sd3_t5_uncond_behaviour {empty_string,zero}]
                 [--lora_type {standard,lycoris}]
                 [--lora_init_type {default,gaussian,loftq,olora,pissa}]
                 [--init_lora INIT_LORA] [--lora_rank LORA_RANK]
@@ -390,7 +426,7 @@ usage: train.py [-h] [--snr_gamma SNR_GAMMA] [--use_soft_min_snr]
                 [--disable_segmented_timestep_sampling]
                 [--rescale_betas_zero_snr]
                 [--vae_dtype {default,fp16,fp32,bf16}]
-                [--vae_batch_size VAE_BATCH_SIZE]
+                [--vae_batch_size VAE_BATCH_SIZE] [--vae_enable_tiling]
                 [--vae_cache_scan_behaviour {recreate,sync}]
                 [--vae_cache_ondemand] [--compress_disk_cache]
                 [--aspect_bucket_disable_rebuild] [--keep_vae_loaded]
@@ -437,14 +473,15 @@ usage: train.py [-h] [--snr_gamma SNR_GAMMA] [--use_soft_min_snr]
                 [--lr_scheduler {linear,sine,cosine,cosine_with_restarts,polynomial,constant,constant_with_warmup}]
                 [--lr_warmup_steps LR_WARMUP_STEPS]
                 [--lr_num_cycles LR_NUM_CYCLES] [--lr_power LR_POWER]
-                [--use_ema] [--ema_device {cpu,accelerator}] [--ema_cpu_only]
+                [--use_ema] [--ema_device {cpu,accelerator}]
+                [--ema_validation {none,ema_only,comparison}] [--ema_cpu_only]
                 [--ema_foreach_disable]
                 [--ema_update_interval EMA_UPDATE_INTERVAL]
                 [--ema_decay EMA_DECAY] [--non_ema_revision NON_EMA_REVISION]
                 [--offload_param_path OFFLOAD_PARAM_PATH] --optimizer
-                {adamw_bf16,ao-adamw8bit,ao-adamw4bit,ao-adamfp8,ao-adamwfp8,adamw_schedulefree,adamw_schedulefree+aggressive,adamw_schedulefree+no_kahan,optimi-stableadamw,optimi-adamw,optimi-lion,optimi-radam,optimi-ranger,optimi-adan,optimi-adam,optimi-sgd}
+                {adamw_bf16,ao-adamw8bit,ao-adamw4bit,ao-adamfp8,ao-adamwfp8,adamw_schedulefree,adamw_schedulefree+aggressive,adamw_schedulefree+no_kahan,optimi-stableadamw,optimi-adamw,optimi-lion,optimi-radam,optimi-ranger,optimi-adan,optimi-adam,optimi-sgd,soap,bnb-adagrad,bnb-adagrad8bit,bnb-adam,bnb-adam8bit,bnb-adamw,bnb-adamw8bit,bnb-adamw-paged,bnb-adamw8bit-paged,bnb-ademamix,bnb-ademamix8bit,bnb-ademamix-paged,bnb-ademamix8bit-paged,bnb-lion,bnb-lion8bit,bnb-lion-paged,bnb-lion8bit-paged}
                 [--optimizer_config OPTIMIZER_CONFIG]
-                [--optimizer_cpu_offload_method {none,torchao}]
+                [--optimizer_cpu_offload_method {none}]
                 [--optimizer_offload_gradients] [--fuse_optimizer]
                 [--optimizer_beta1 OPTIMIZER_BETA1]
                 [--optimizer_beta2 OPTIMIZER_BETA2]
@@ -457,9 +494,16 @@ usage: train.py [-h] [--snr_gamma SNR_GAMMA] [--use_soft_min_snr]
                 [--model_card_note MODEL_CARD_NOTE]
                 [--model_card_safe_for_work] [--logging_dir LOGGING_DIR]
                 [--benchmark_base_model] [--disable_benchmark]
+                [--evaluation_type {clip,none}]
+                [--pretrained_evaluation_model_name_or_path PRETRAINED_EVALUATION_MODEL_NAME_OR_PATH]
                 [--validation_on_startup] [--validation_seed_source {gpu,cpu}]
+                [--validation_lycoris_strength VALIDATION_LYCORIS_STRENGTH]
                 [--validation_torch_compile]
                 [--validation_torch_compile_mode {max-autotune,reduce-overhead,default}]
+                [--validation_guidance_skip_layers VALIDATION_GUIDANCE_SKIP_LAYERS]
+                [--validation_guidance_skip_layers_start VALIDATION_GUIDANCE_SKIP_LAYERS_START]
+                [--validation_guidance_skip_layers_stop VALIDATION_GUIDANCE_SKIP_LAYERS_STOP]
+                [--validation_guidance_skip_scale VALIDATION_GUIDANCE_SKIP_SCALE]
                 [--allow_tf32] [--disable_tf32] [--validation_using_datasets]
                 [--webhook_config WEBHOOK_CONFIG]
                 [--webhook_reporting_interval WEBHOOK_REPORTING_INTERVAL]
@@ -481,12 +525,15 @@ usage: train.py [-h] [--snr_gamma SNR_GAMMA] [--use_soft_min_snr]
                 [--mixed_precision {bf16,no}]
                 [--gradient_precision {unmodified,fp32}]
                 [--quantize_via {cpu,accelerator}]
-                [--base_model_precision {no_change,fp8-quanto,fp8uz-quanto,int8-quanto,int4-quanto,int2-quanto,int8-torchao}]
+                [--base_model_precision {no_change,int8-quanto,int4-quanto,int2-quanto,int8-torchao,nf4-bnb,fp8-quanto,fp8uz-quanto}]
+                [--quantize_activations]
                 [--base_model_default_dtype {bf16,fp32}]
-                [--text_encoder_1_precision {no_change,fp8-quanto,fp8uz-quanto,int8-quanto,int4-quanto,int2-quanto,int8-torchao}]
-                [--text_encoder_2_precision {no_change,fp8-quanto,fp8uz-quanto,int8-quanto,int4-quanto,int2-quanto,int8-torchao}]
-                [--text_encoder_3_precision {no_change,fp8-quanto,fp8uz-quanto,int8-quanto,int4-quanto,int2-quanto,int8-torchao}]
+                [--text_encoder_1_precision {no_change,int8-quanto,int4-quanto,int2-quanto,int8-torchao,nf4-bnb,fp8-quanto,fp8uz-quanto}]
+                [--text_encoder_2_precision {no_change,int8-quanto,int4-quanto,int2-quanto,int8-torchao,nf4-bnb,fp8-quanto,fp8uz-quanto}]
+                [--text_encoder_3_precision {no_change,int8-quanto,int4-quanto,int2-quanto,int8-torchao,nf4-bnb,fp8-quanto,fp8uz-quanto}]
                 [--local_rank LOCAL_RANK]
+                [--attention_mechanism {diffusers,xformers,sageattention,sageattention-int8-fp16-triton,sageattention-int8-fp16-cuda,sageattention-int8-fp8-cuda}]
+                [--sageattention_usage {training,inference,training+inference}]
                 [--enable_xformers_memory_efficient_attention]
                 [--set_grads_to_none] [--noise_offset NOISE_OFFSET]
                 [--noise_offset_probability NOISE_OFFSET_PROBABILITY]
@@ -562,6 +609,21 @@ options:
                         schedule closer to what it was trained with, which has
                         improved results in short experiments. Thanks to
                         @mhirki for the contribution.
+  --flux_use_uniform_schedule
+                        Whether or not to use a uniform schedule with Flux
+                        instead of sigmoid. Using uniform sampling may help
+                        preserve more capabilities from the base model. Some
+                        tasks may not benefit from this.
+  --flux_use_beta_schedule
+                        Whether or not to use a beta schedule with Flux
+                        instead of sigmoid. The default values of alpha and
+                        beta approximate a sigmoid.
+  --flux_beta_schedule_alpha FLUX_BETA_SCHEDULE_ALPHA
+                        The alpha value of the flux beta schedule. Default is
+                        2.0
+  --flux_beta_schedule_beta FLUX_BETA_SCHEDULE_BETA
+                        The beta value of the flux beta schedule. Default is
+                        2.0
   --flux_schedule_shift FLUX_SCHEDULE_SHIFT
                         Shift the noise schedule. This is a value between 0
                         and ~4.0, where 0 disables the timestep-dependent
@@ -621,28 +683,26 @@ options:
   --smoldit_config {smoldit-small,smoldit-swiglu,smoldit-base,smoldit-large,smoldit-huge}
                         The SmolDiT configuration to use. This is a list of
                         pre-configured models. The default is 'smoldit-base'.
-  --flow_matching_loss {diffusers,compatible,diffusion}
+  --flow_matching_loss {diffusers,compatible,diffusion,sd35}
                         A discrepancy exists between the Diffusers
                         implementation of flow matching and the minimal
                         implementation provided by StabilityAI. This
                         experimental option allows switching loss calculations
                         to be compatible with those. Additionally, 'diffusion'
                         is offered as an option to reparameterise a model to
-                        v_prediction loss.
-  --sd3_t5_mask_behaviour {do-nothing,mask}
-                        StabilityAI did not correctly implement their
-                        attention masking on T5 inputs for SD3 Medium. This
-                        option enables you to switch between their broken
-                        implementation or the corrected mask implementation.
-                        Although, the corrected masking is still applied via
-                        hackish workaround, manually applying the mask to the
-                        prompt embeds so that the padded positions are zero.
-                        This improves the results for short captions, but does
-                        not change the behaviour for long captions. It is
-                        important to note that this limitation currently
-                        prevents expansion of SD3 Medium's prompt length, as
-                        it will unnecessarily attend to every token in the
-                        prompt embed, even masked positions.
+                        v_prediction loss. sd35 provides the ability to train
+                        on SD3.5's flow-matching target, which is the denoised
+                        sample.
+  --sd3_clip_uncond_behaviour {empty_string,zero}
+                        SD3 can be trained using zeroed prompt embeds during
+                        unconditional dropout, or an encoded empty string may
+                        be used instead (the default). Changing this value may
+                        stabilise or destabilise training. The default is
+                        'empty_string'.
+  --sd3_t5_uncond_behaviour {empty_string,zero}
+                        Override the value of unconditional prompts from T5
+                        embeds. The default is to follow the value of
+                        --sd3_clip_uncond_behaviour.
   --lora_type {standard,lycoris}
                         When training using --model_type=lora, you may specify
                         a different type of LoRA to train here. standard
@@ -806,6 +866,11 @@ options:
                         issues, but if you are at that point of contention,
                         it's possible that your GPU has too little RAM.
                         Default: 4.
+  --vae_enable_tiling   If set, will enable tiling for VAE caching. This is
+                        useful for very large images when VRAM is limited.
+                        This may be required for 2048px VAE caching on 24G
+                        accelerators, in addition to reducing
+                        --vae_batch_size.
   --vae_cache_scan_behaviour {recreate,sync}
                         When a mismatched latent vector is detected, a scan
                         will be initiated to locate inconsistencies and
@@ -1097,12 +1162,21 @@ options:
                         cosine_with_restarts scheduler.
   --lr_power LR_POWER   Power factor of the polynomial scheduler.
   --use_ema             Whether to use EMA (exponential moving average) model.
+                        Works with LoRA, Lycoris, and full training.
   --ema_device {cpu,accelerator}
                         The device to use for the EMA model. If set to
                         'accelerator', the EMA model will be placed on the
                         accelerator. This provides the fastest EMA update
                         times, but is not ultimately necessary for EMA to
                         function.
+  --ema_validation {none,ema_only,comparison}
+                        When 'none' is set, no EMA validation will be done.
+                        When using 'ema_only', the validations will rely
+                        mostly on the EMA weights. When using 'comparison'
+                        (default) mode, the validations will first run on the
+                        checkpoint before also running for the EMA weights. In
+                        comparison mode, the resulting images will be provided
+                        side-by-side.
   --ema_cpu_only        When using EMA, the shadow model is moved to the
                         accelerator before we update its parameters. When
                         provided, this option will disable the moving of the
@@ -1132,16 +1206,16 @@ options:
                         When using DeepSpeed ZeRo stage 2 or 3 with NVMe
                         offload, this may be specified to provide a path for
                         the offload.
-  --optimizer {adamw_bf16,ao-adamw8bit,ao-adamw4bit,ao-adamfp8,ao-adamwfp8,adamw_schedulefree,adamw_schedulefree+aggressive,adamw_schedulefree+no_kahan,optimi-stableadamw,optimi-adamw,optimi-lion,optimi-radam,optimi-ranger,optimi-adan,optimi-adam,optimi-sgd}
+  --optimizer {adamw_bf16,ao-adamw8bit,ao-adamw4bit,ao-adamfp8,ao-adamwfp8,adamw_schedulefree,adamw_schedulefree+aggressive,adamw_schedulefree+no_kahan,optimi-stableadamw,optimi-adamw,optimi-lion,optimi-radam,optimi-ranger,optimi-adan,optimi-adam,optimi-sgd,soap,bnb-adagrad,bnb-adagrad8bit,bnb-adam,bnb-adam8bit,bnb-adamw,bnb-adamw8bit,bnb-adamw-paged,bnb-adamw8bit-paged,bnb-ademamix,bnb-ademamix8bit,bnb-ademamix-paged,bnb-ademamix8bit-paged,bnb-lion,bnb-lion8bit,bnb-lion-paged,bnb-lion8bit-paged}
   --optimizer_config OPTIMIZER_CONFIG
                         When setting a given optimizer, this allows a comma-
                         separated list of key-value pairs to be provided that
                         will override the optimizer defaults. For example, `--
                         optimizer_config=decouple_lr=True,weight_decay=0.01`.
-  --optimizer_cpu_offload_method {none,torchao}
-                        When loading an optimiser, a CPU offload mechanism can
-                        be used. Currently, no offload is used by default, and
-                        only torchao is supported.
+  --optimizer_cpu_offload_method {none}
+                        This option is a placeholder. In the future, it will
+                        allow for the selection of different CPU offload
+                        methods.
   --optimizer_offload_gradients
                         When creating a CPU-offloaded optimiser, the gradients
                         can be offloaded to the CPU to save more memory.
@@ -1203,6 +1277,16 @@ options:
   --disable_benchmark   By default, the model will be benchmarked on the first
                         batch of the first epoch. This can be disabled with
                         this option.
+  --evaluation_type {clip,none}
+                        Validations must be enabled for model evaluation to
+                        function. The default is to use no evaluator, and
+                        'clip' will use a CLIP model to evaluate the resulting
+                        model's performance during validations.
+  --pretrained_evaluation_model_name_or_path PRETRAINED_EVALUATION_MODEL_NAME_OR_PATH
+                        Optionally provide a custom model to use for ViT
+                        evaluations. The default is currently clip-vit-large-
+                        patch14-336, allowing for lower patch sizes (greater
+                        accuracy) and an input resolution of 336x336.
   --validation_on_startup
                         When training begins, the starting model will have
                         validation prompts run through it, for later
@@ -1214,6 +1298,12 @@ options:
                         validation errors. If so, please set
                         SIMPLETUNER_LOG_LEVEL=DEBUG and submit debug.log to a
                         new Github issue report.
+  --validation_lycoris_strength VALIDATION_LYCORIS_STRENGTH
+                        When inferencing for validations, the Lycoris model
+                        will by default be run at its training strength, 1.0.
+                        However, this value can be increased to a value of
+                        around 1.3 or 1.5 to get a stronger effect from the
+                        model.
   --validation_torch_compile
                         Supply `--validation_torch_compile=true` to enable the
                         use of torch.compile() on the validation pipeline. For
@@ -1225,6 +1315,18 @@ options:
                         PyTorch provides different modes for the Torch
                         Inductor when compiling graphs. max-autotune, the
                         default mode, provides the most benefit.
+  --validation_guidance_skip_layers VALIDATION_GUIDANCE_SKIP_LAYERS
+                        StabilityAI recommends a value of [7, 8, 9] for Stable
+                        Diffusion 3.5 Medium.
+  --validation_guidance_skip_layers_start VALIDATION_GUIDANCE_SKIP_LAYERS_START
+                        StabilityAI recommends a value of 0.01 for SLG start.
+  --validation_guidance_skip_layers_stop VALIDATION_GUIDANCE_SKIP_LAYERS_STOP
+                        StabilityAI recommends a value of 0.2 for SLG start.
+  --validation_guidance_skip_scale VALIDATION_GUIDANCE_SKIP_SCALE
+                        StabilityAI recommends a value of 2.8 for SLG guidance
+                        skip scaling. When adding more layers, you must
+                        increase the scale, eg. adding one more layer requires
+                        doubling the value given.
   --allow_tf32          Deprecated option. TF32 is now enabled by default. Use
                         --disable_tf32 to disable.
   --disable_tf32        Previous defaults were to disable TF32 on Ampere GPUs.
@@ -1344,7 +1446,7 @@ options:
                         required, but the process completes in milliseconds.
                         When done on the CPU, the process may take upwards of
                         60 seconds, but can complete without OOM on 16G cards.
-  --base_model_precision {no_change,fp8-quanto,fp8uz-quanto,int8-quanto,int4-quanto,int2-quanto,int8-torchao}
+  --base_model_precision {no_change,int8-quanto,int4-quanto,int2-quanto,int8-torchao,nf4-bnb,fp8-quanto,fp8uz-quanto}
                         When training a LoRA, you might want to quantise the
                         base model to a lower precision to save more VRAM. The
                         default value, 'no_change', does not quantise any
@@ -1352,6 +1454,9 @@ options:
                         Bits n Bytes for quantisation (NVIDIA, maybe AMD).
                         Using 'fp8-quanto' will require Quanto for
                         quantisation (Apple Silicon, NVIDIA, AMD).
+  --quantize_activations
+                        (EXPERIMENTAL) This option is currently unsupported,
+                        and exists solely for development purposes.
   --base_model_default_dtype {bf16,fp32}
                         Unlike --mixed_precision, this value applies
                         specifically for the default weights of your quantised
@@ -1362,7 +1467,7 @@ options:
                         optimizers than adamw_bf16. However, this uses
                         marginally more memory, and may not be necessary for
                         your use case.
-  --text_encoder_1_precision {no_change,fp8-quanto,fp8uz-quanto,int8-quanto,int4-quanto,int2-quanto,int8-torchao}
+  --text_encoder_1_precision {no_change,int8-quanto,int4-quanto,int2-quanto,int8-torchao,nf4-bnb,fp8-quanto,fp8uz-quanto}
                         When training a LoRA, you might want to quantise text
                         encoder 1 to a lower precision to save more VRAM. The
                         default value is to follow base_model_precision
@@ -1370,7 +1475,7 @@ options:
                         Bits n Bytes for quantisation (NVIDIA, maybe AMD).
                         Using 'fp8-quanto' will require Quanto for
                         quantisation (Apple Silicon, NVIDIA, AMD).
-  --text_encoder_2_precision {no_change,fp8-quanto,fp8uz-quanto,int8-quanto,int4-quanto,int2-quanto,int8-torchao}
+  --text_encoder_2_precision {no_change,int8-quanto,int4-quanto,int2-quanto,int8-torchao,nf4-bnb,fp8-quanto,fp8uz-quanto}
                         When training a LoRA, you might want to quantise text
                         encoder 2 to a lower precision to save more VRAM. The
                         default value is to follow base_model_precision
@@ -1378,7 +1483,7 @@ options:
                         Bits n Bytes for quantisation (NVIDIA, maybe AMD).
                         Using 'fp8-quanto' will require Quanto for
                         quantisation (Apple Silicon, NVIDIA, AMD).
-  --text_encoder_3_precision {no_change,fp8-quanto,fp8uz-quanto,int8-quanto,int4-quanto,int2-quanto,int8-torchao}
+  --text_encoder_3_precision {no_change,int8-quanto,int4-quanto,int2-quanto,int8-torchao,nf4-bnb,fp8-quanto,fp8uz-quanto}
                         When training a LoRA, you might want to quantise text
                         encoder 3 to a lower precision to save more VRAM. The
                         default value is to follow base_model_precision
@@ -1388,8 +1493,32 @@ options:
                         quantisation (Apple Silicon, NVIDIA, AMD).
   --local_rank LOCAL_RANK
                         For distributed training: local_rank
+  --attention_mechanism {diffusers,xformers,sageattention,sageattention-int8-fp16-triton,sageattention-int8-fp16-cuda,sageattention-int8-fp8-cuda}
+                        On NVIDIA CUDA devices, alternative flash attention
+                        implementations are offered, with the default being
+                        native pytorch SDPA. SageAttention has multiple
+                        backends to select from. The recommended value,
+                        'sageattention', guesses what would be the 'best'
+                        option for SageAttention on your hardware (usually
+                        this is the int8-fp16-cuda backend). However, manually
+                        setting this value to int8-fp16-triton may provide
+                        better averages for per-step training and inference
+                        performance while the cuda backend may provide the
+                        highest maximum speed (with also a lower minimum
+                        speed). NOTE: SageAttention training quality has not
+                        been validated.
+  --sageattention_usage {training,inference,training+inference}
+                        SageAttention breaks gradient tracking through the
+                        backward pass, leading to untrained QKV layers. This
+                        can result in substantial problems for training, so it
+                        is recommended to use SageAttention only for inference
+                        (default behaviour). If you are confident in your
+                        training setup or do not wish to train QKV layers, you
+                        may use 'training' to enable SageAttention for
+                        training.
   --enable_xformers_memory_efficient_attention
-                        Whether or not to use xformers.
+                        Whether or not to use xformers. Deprecated and slated
+                        for future removal. Use --attention_mechanism.
   --set_grads_to_none   Save more memory by using setting grads to None
                         instead of zero. Be aware, that this changes certain
                         behaviors, so disable this argument if it causes any

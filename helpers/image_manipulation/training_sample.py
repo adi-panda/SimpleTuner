@@ -25,6 +25,7 @@ class TrainingSample:
         data_backend_id: str,
         image_metadata: dict = None,
         image_path: str = None,
+        conditioning_type: str = None,
     ):
         """
         Initializes a new TrainingSample instance with a provided PIL.Image object and a data backend identifier.
@@ -38,6 +39,7 @@ class TrainingSample:
         self.target_size = None
         self.intermediary_size = None
         self.original_size = None
+        self.conditioning_type = conditioning_type
         self.data_backend_id = data_backend_id
         self.image_metadata = (
             image_metadata
@@ -78,7 +80,10 @@ class TrainingSample:
         self.resolution = self.data_backend_config.get("resolution")
         self.resolution_type = self.data_backend_config.get("resolution_type")
         self.target_size_calculator = resize_helpers.get(self.resolution_type)
-        if self.target_size_calculator is None:
+        if self.target_size_calculator is None and conditioning_type not in [
+            "mask",
+            "controlnet",
+        ]:
             raise ValueError(f"Unknown resolution type: {self.resolution_type}")
         self._set_resolution()
         self.target_downsample_size = self.data_backend_config.get(
@@ -110,7 +115,7 @@ class TrainingSample:
             TrainingSample: A new TrainingSample instance.
         """
         data_backend = StateTracker.get_data_backend(data_backend_id)
-        image = data_backend["metadata_backend"].read_image(image_path)
+        image = data_backend["data_backend"].read_image(image_path)
         return TrainingSample(image, data_backend_id, image_path=image_path)
 
     def _validate_image_metadata(self) -> bool:
@@ -192,7 +197,7 @@ class TrainingSample:
             # If any of the aspect buckets will result in that, we'll ignore it.
             if type(bucket) is dict:
                 aspect = bucket["aspect_ratio"]
-            elif type(bucket) is float:
+            elif type(bucket) is float or type(bucket) is int:
                 aspect = bucket
             else:
                 raise ValueError(
@@ -297,6 +302,26 @@ class TrainingSample:
 
         # Default to 1.0 if none of the conditions above match
         return 1.0
+
+    def prepare_like(self, other_sample, return_tensor=False):
+        """
+        Prepare the current TrainingSample in the same way as other_sample.
+
+        Args:
+            other_sample (TrainingSample): The sample to mimic.
+            return_tensors (bool): Whether to return tensors.
+
+        Returns:
+            PreparedSample: The prepared sample.
+        """
+        # Copy over the image metadata from the other sample
+        self.image_metadata = (
+            other_sample.image_metadata.copy() if other_sample.image_metadata else {}
+        )
+        # Validate the metadata to set internal attributes
+        self._validate_image_metadata()
+        # Proceed to prepare the image
+        return self.prepare(return_tensor=return_tensor)
 
     def prepare(self, return_tensor: bool = False):
         """
@@ -601,20 +626,11 @@ class TrainingSample:
         """
         return self.image
 
-    def get_conditioning_image(self):
-        """
-        Fetch a conditioning image, eg. a canny edge map for ControlNet training.
-        Currently, this example is not implemented or used.
+    def is_conditioning_sample(self):
+        return self.conditioning_type is not None
 
-        Returns:
-            None
-        """
-        if not StateTracker.get_args().controlnet:
-            return None
-        conditioning_dataset = StateTracker.get_conditioning_dataset(
-            data_backend_id=self.data_backend_id
-        )
-        raise NotImplementedError("Conditioning images are not yet implemented.")
+    def get_conditioning_type(self):
+        return self.conditioning_type
 
     def cache_path(self):
         """

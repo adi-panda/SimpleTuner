@@ -33,7 +33,7 @@ default_models = {
     "pixart_sigma": "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS",
     "kolors": "kwai-kolors/kolors-diffusers",
     "terminus": "ptx0/terminus-xl-velocity-v2",
-    "sd3": "stabilityai/stable-diffusion-3-medium-diffusers",
+    "sd3": "stabilityai/stable-diffusion-3.5-large",
     "legacy": "stabilityai/stable-diffusion-2-1-base",
 }
 
@@ -301,7 +301,7 @@ def configure_env():
 
             # approximate the rank of the lycoris
             lora_rank = 16
-            with open("config/lycoris_config.json", "w") as f:
+            with open("config/lycoris_config.json", "w", encoding="utf-8") as f:
                 f.write(json.dumps(lycoris_config, indent=4))
         else:
             env_contents["--lora_type"] = "standard"
@@ -429,7 +429,36 @@ def configure_env():
         ).lower()
         == "y"
     )
-    report_to_str = ""
+
+    env_contents["--attention_mechanism"] = "diffusers"
+    use_sageattention = (
+        prompt_user(
+            "Would you like to use SageAttention for image validation generation? (y/[n])",
+            "n",
+        ).lower()
+        == "y"
+    )
+    if use_sageattention:
+        env_contents["--attention_mechanism"] = "sageattention"
+        env_contents["--sageattention_usage"] = "inference"
+        use_sageattention_training = (
+            prompt_user(
+                (
+                    "Would you like to use SageAttention to cover the forward and backward pass during training?"
+                    " This has the undesirable consequence of leaving the attention layers untrained,"
+                    " as SageAttention lacks the capability to fully track gradients through quantisation."
+                    " If you are not training the attention layers for some reason, this may not matter and"
+                    " you can safely enable this. For all other use-cases, reconsideration and caution are warranted."
+                ),
+                "n",
+            ).lower()
+            == "y"
+        )
+        if use_sageattention_training:
+            env_contents["--sageattention_usage"] = "both"
+
+    # properly disable wandb/tensorboard/comet_ml etc by default
+    report_to_str = "none"
     if report_to_wandb or report_to_tensorboard:
         tracker_project_name = prompt_user(
             "Enter the name of your Weights & Biases project", f"{model_type}-training"
@@ -440,17 +469,17 @@ def configure_env():
             f"simpletuner-{model_type}",
         )
         env_contents["--tracker_run_name"] = tracker_run_name
-        report_to_str = None
         if report_to_wandb:
             report_to_str = "wandb"
         if report_to_tensorboard:
-            if report_to_wandb:
+            if report_to_str != "none":
+                # report to both WandB and Tensorboard if the user wanted.
                 report_to_str += ","
             else:
+                # remove 'none' from the option
                 report_to_str = ""
             report_to_str += "tensorboard"
-        if report_to_str:
-            env_contents["--report_to"] = report_to_str
+    env_contents["--report_to"] = report_to_str
 
     print_config(env_contents, extra_args)
 
@@ -514,6 +543,18 @@ def configure_env():
         )
     )
     env_contents["--gradient_checkpointing"] = "true"
+    gradient_checkpointing_interval = prompt_user(
+        "Would you like to configure a gradient checkpointing interval? A value larger than 1 will increase VRAM usage but speed up training by skipping checkpoint creation every Nth layer, and a zero will disable this feature.",
+        0,
+    )
+    try:
+        if int(gradient_checkpointing_interval) > 1:
+            env_contents["--gradient_checkpointing_interval"] = int(
+                gradient_checkpointing_interval
+            )
+    except:
+        print("Could not parse gradient checkpointing interval. Not enabling.")
+        pass
 
     env_contents["--caption_dropout_probability"] = float(
         prompt_user(
@@ -664,7 +705,7 @@ def configure_env():
             if quantization_type:
                 print(f"Invalid quantization type: {quantization_type}")
             quantization_type = prompt_user(
-                f"Choose quantization type. int4 may only work on A100, H100, or Apple systems. (Options: {'/'.join(quantised_precision_levels)})",
+                f"Choose quantization type. (Options: {'/'.join(quantised_precision_levels)})",
                 "int8-quanto",
             )
         env_contents["--base_model_precision"] = quantization_type
@@ -772,6 +813,43 @@ def configure_env():
         },
     ]
 
+    # Let's offer to generate a prompt library for the user. Preserve their existing one if it already exists.
+    should_generate_by_default = "n"
+    if not os.path.exists("config/user_prompt_library.json"):
+        should_generate_by_default = "y"
+    should_generate_prompt_library = (
+        prompt_user(
+            (
+                "Would you like to generate a very rudimentary subject-centric prompt library for your dataset?"
+                " This will download a small 1B Llama 3.2 model."
+                " If a user prompt library exists, it will be overwritten. (y/n)"
+            ),
+            should_generate_by_default,
+        ).lower()
+        == "y"
+    )
+    if should_generate_prompt_library:
+        try:
+            user_caption_trigger = prompt_user(
+                "Enter a trigger word (or a few words) that you would like Llama 3.2 1B to expand.",
+                "Character Name",
+            )
+            number_of_prompts = int(
+                prompt_user("How many prompts would you like to generate?", 8)
+            )
+            from helpers.prompt_expander import PromptExpander
+
+            PromptExpander.initialize_model()
+            user_prompt_library = PromptExpander.generate_prompts(
+                trigger_phrase=user_caption_trigger, num_prompts=number_of_prompts
+            )
+            with open("config/user_prompt_library.json", "w", encoding="utf-8") as f:
+                f.write(json.dumps(user_prompt_library, indent=4))
+            print("Prompt library generated successfully!")
+            env_contents["--user_prompt_library"] = "config/user_prompt_library.json"
+        except Exception as e:
+            print(f"(warning) Failed to generate prompt library: {e}")
+
     # now we ask user the path to their data, the path to the cache (cache/), number of repeats, update the id placeholder based on users dataset name
     # then we'll write the file to multidatabackend.json
     should_configure_dataloader = (
@@ -789,6 +867,26 @@ def configure_env():
         "Enter the path to your dataset. This should be a directory containing images and text files for their caption. For reliability, use an absolute (full) path, beginning with a '/'",
         "/datasets/my-dataset",
     )
+    dataset_caption_strategy = prompt_user(
+        (
+            "How should the dataloader handle captions?"
+            "\n-> 'filename' will use the names of your image files as the caption"
+            "\n-> 'textfile' requires a image.txt file to go next to your image.png file"
+            "\n-> 'instanceprompt' will just use one trigger phrase for all images"
+            "\n"
+            "\n(Options: filename, textfile, instanceprompt)"
+        ),
+        "textfile",
+    )
+    if dataset_caption_strategy not in ["filename", "textfile", "instanceprompt"]:
+        print(f"Invalid caption strategy: {dataset_caption_strategy}")
+        dataset_caption_strategy = "textfile"
+    dataset_instance_prompt = None
+    if "instanceprompt" in dataset_caption_strategy:
+        dataset_instance_prompt = prompt_user(
+            "Enter the instance_prompt you want to use for all images in this dataset",
+            "Character Name",
+        )
     dataset_repeats = int(
         prompt_user(
             "How many times do you want to repeat each image in the dataset?", 10
@@ -818,6 +916,9 @@ def configure_env():
             dataset["maximum_image_size"] = dataset["resolution"]
             dataset["target_downsample_size"] = dataset["resolution"]
         dataset["id"] = dataset["id"].replace("PLACEHOLDER", dataset_id)
+        if dataset_instance_prompt:
+            dataset["instance_prompt"] = dataset_instance_prompt
+        dataset["caption_strategy"] = dataset_caption_strategy
 
     print("Dataloader configuration:")
     print(default_local_configuration)
@@ -825,7 +926,7 @@ def configure_env():
     if confirm:
         import json
 
-        with open("config/multidatabackend.json", "w") as f:
+        with open("config/multidatabackend.json", "w", encoding="utf-8") as f:
             f.write(json.dumps(default_local_configuration, indent=4))
         print("Dataloader configuration written successfully!")
 

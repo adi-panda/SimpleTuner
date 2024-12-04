@@ -37,6 +37,8 @@ For a quick start without reading the full documentation, you can use the [Quick
 
 For memory-constrained systems, see the [DeepSpeed document](/documentation/DEEPSPEED.md) which explains how to use 🤗Accelerate to configure Microsoft's DeepSpeed for optimiser state offload.
 
+For multi-node distributed training, [this guide](/documentation/DISTRIBUTED.md) will help tweak the configurations from the INSTALL and Quickstart guides to be suitable for multi-node training, and optimising for image datasets numbering in the billions of samples.
+
 ---
 
 ## Features
@@ -48,11 +50,13 @@ For memory-constrained systems, see the [DeepSpeed document](/documentation/DEEP
 - Most models are trainable on a 24G GPU, or even down to 16G at lower base resolutions.
   - LoRA/LyCORIS training for PixArt, SDXL, SD3, and SD 2.x that uses less than 16G VRAM
 - DeepSpeed integration allowing for [training SDXL's full u-net on 12G of VRAM](/documentation/DEEPSPEED.md), albeit very slowly.
-- Quantised LoRA training, using low-precision base model or text encoder weights to reduce VRAM consumption while still allowing DreamBooth.
-- Optional EMA (Exponential moving average) weight network to counteract model overfitting and improve training stability. **Note:** This does not apply to LoRA.
+- Quantised NF4/INT8/FP8 LoRA training, using low-precision base model to reduce VRAM consumption.
+- Optional EMA (Exponential moving average) weight network to counteract model overfitting and improve training stability.
 - Train directly from an S3-compatible storage provider, eliminating the requirement for expensive local storage. (Tested with Cloudflare R2 and Wasabi S3)
 - For only SDXL and SD 1.x/2.x, full [ControlNet model training](/documentation/CONTROLNET.md) (not ControlLoRA or ControlLite)
 - Training [Mixture of Experts](/documentation/MIXTURE_OF_EXPERTS.md) for lightweight, high-quality diffusion models
+- [Masked loss training](/documentation/DREAMBOOTH.md#masked-loss) for superior convergence and reduced overfitting on any model
+- Strong [prior regularisation](/documentation/DATALOADER.md#is_regularisation_data) training support for LyCORIS models
 - Webhook support for updating eg. Discord channels with your training progress, validations, and errors
 - Integration with the [Hugging Face Hub](https://huggingface.co) for seamless model upload and nice automatically-generated model cards.
 
@@ -105,7 +109,7 @@ RunwayML's SD 1.5 and StabilityAI's SD 2.x are both trainable under the `legacy`
 
 ### NVIDIA
 
-Pretty much anything 3090 and up is a safe bet. YMMV.
+Pretty much anything 3080 and up is a safe bet. YMMV.
 
 ### AMD
 
@@ -124,7 +128,8 @@ LoRA and full-rank tuning are tested to work on an M3 Max with 128G memory, taki
 - A100-80G (Full tune with DeepSpeed)
 - A100-40G (LoRA, LoKr)
 - 3090 24G (LoRA, LoKr)
-- 4060 Ti, 3080 16G (int8, LoRA, LoKr)
+- 4060 Ti 16G, 4070 Ti 16G, 3080 16G (int8, LoRA, LoKr)
+- 4070 Super 12G, 3080 10G, 3060 12GB (nf4, LoRA, LoKr)
 
 Flux prefers being trained with multiple large GPUs but a single 16G card should be able to do it with quantisation of the transformer and text encoders.
 
@@ -132,8 +137,8 @@ Flux prefers being trained with multiple large GPUs but a single 16G card should
 
 - A100-80G (EMA, large batches, LoRA @ insane batch sizes)
 - A6000-48G (EMA@768px, no EMA@1024px, LoRA @ high batch sizes)
-- A100-40G (no EMA@1024px, no EMA@768px, EMA@512px, LoRA @ high batch sizes)
-- 4090-24G (no EMA@1024px, batch size 1-4, LoRA @ medium-high batch sizes)
+- A100-40G (EMA@1024px, EMA@768px, EMA@512px, LoRA @ high batch sizes)
+- 4090-24G (EMA@1024px, batch size 1-4, LoRA @ medium-high batch sizes)
 - 4080-12G (LoRA @ low-medium batch sizes)
 
 ### Stable Diffusion 2.x, 768px

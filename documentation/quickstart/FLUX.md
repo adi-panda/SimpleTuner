@@ -12,10 +12,11 @@ When you're training every component of a rank-16 LoRA (MLP, projections, multim
 - a bit more than 30G VRAM when not quantising the base model
 - a bit more than 18G VRAM when quantising to int8 + bf16 base/LoRA weights
 - a bit more than 13G VRAM when quantising to int4 + bf16 base/LoRA weights
+- a bit more than 9G VRAM when quantising to NF4 + bf16 base/LoRA weights
 - a bit more than 9G VRAM when quantising to int2 + bf16 base/LoRA weights
 
 You'll need: 
-- **the absolute minimum** is a single 4060 Ti 16GB
+- **the absolute minimum** is a single **3080 10G**
 - **a realistic minimum** is a single 3090 or V100 GPU
 - **ideally** multiple 4090, A6000, L40S, or better
 
@@ -64,6 +65,9 @@ python3.11 -m venv .venv
 source .venv/bin/activate
 
 pip install -U poetry pip
+
+# Necessary on some systems to prevent it from deciding it knows better than us.
+poetry config virtualenvs.create false
 ```
 
 **Note:** We're currently installing the `release` branch here; the `main` branch may contain experimental features that might have better results or lower memory use.
@@ -140,6 +144,8 @@ There, you will possibly need to modify the following variables:
   - This option causes update steps to be accumulated over several steps. This will increase the training runtime linearly, such that a value of 2 will make your training run half as quickly, and take twice as long.
 - `optimizer` - Beginners are recommended to stick with adamw_bf16, though optimi-lion and optimi-stableadamw are also good choices.
 - `mixed_precision` - Beginners should keep this in `bf16`
+- `gradient_checkpointing` - set this to true in practically every situation on every device
+- `gradient_checkpointing_interval` - this could be set to a value of 2 or higher on larger GPUs to only checkpoint every _n_ blocks. A value of 2 would checkpoint half of the blocks, and 3 would be one-third.
 
 Multi-GPU users can reference [this document](/OPTIONS.md#environment-configuration-variables) for information on configuring the number of GPUs to use.
 
@@ -186,6 +192,30 @@ A set of diverse prompt will help determine whether the model is collapsing as i
 ```
 
 > ℹ️ Flux is a flow-matching model and shorter prompts that have strong similarities will result in practically the same image being produced by the model. Be sure to use longer, more descriptive prompts.
+
+#### CLIP score tracking
+
+If you wish to enable evaluations to score the model's performance, see [this document](/documentation/evaluation/CLIP_SCORES.md) for information on configuring and interpreting CLIP scores.
+
+#### Flux time schedule shifting
+
+Flow-matching models such as Flux and SD3 have a property called "shift" that allows us to shift the trained portion of the timestep schedule using a simple decimal value.
+
+##### Defaults
+By default, no schedule shift is applied to flux, which results in a sigmoid bell-shape to the timestep sampling distribution. This is unlikely to be the ideal approach for Flux, but it results in a greater amount of learning in a shorter period of time than auto-shift.
+
+##### Auto-shift
+A commonly-recommended approach is to follow several recent works and enable resolution-dependent timestep shift, `--flux_schedule_auto_shift` which uses higher shift values for larger images, and lower shift values for smaller images. This results in stable but potentially mediocre training results.
+
+##### Manual specification
+_Thanks to General Awareness from Discord for the following examples_
+
+When using a `--flux_schedule_shift` value of 0.1 (a very low value), only the finer details of the image are affected:
+![image](https://github.com/user-attachments/assets/991ca0ad-e25a-4b13-a3d6-b4f2de1fe982)
+
+When using a `--flux_schedule_shift` value of 4.0 (a very high value), the large compositional features and potentially colour space of the model becomes impacted:
+![image](https://github.com/user-attachments/assets/857a1f8a-07ab-4b75-8e6a-eecff616a28d)
+
 
 #### Quantised model training
 
@@ -258,7 +288,8 @@ Create a `--data_backend_config` (`config/multidatabackend.json`) document conta
     "skip_file_discovery": "",
     "caption_strategy": "filename",
     "metadata_backend": "discovery",
-    "repeats": 0
+    "repeats": 0,
+    "is_regularisation_data": true
   },
   {
     "id": "dreambooth-subject",
@@ -370,6 +401,55 @@ Inferencing the CFG-distilled LoRA is as easy as using a lower guidance_scale ar
 
 ## Notes & troubleshooting tips
 
+### Lowest VRAM config
+
+Currently, the lowest VRAM utilisation (9090M) can be attained with:
+
+- OS: Ubuntu Linux 24
+- GPU: A single NVIDIA CUDA device (10G, 12G)
+- System memory: 50G of system memory approximately
+- Base model precision: `bnb-nf4`
+- Optimiser: Lion 8Bit Paged, `bnb-lion8bit-paged`
+- Resolution: 512px
+  - 1024px requires >= 12G VRAM
+- Batch size: 1, zero gradient accumulation steps
+- DeepSpeed: disabled / unconfigured
+- PyTorch: 2.6 Nightly (Sept 29th build)
+- Using `--quantize_via=cpu` to avoid outOfMemory error during startup on <=16G cards.
+- With `--attention_mechanism=sageattention` to further reduce VRAM by 0.1GB and improve training validation image generation speed.
+- Be sure to enable `--gradient_checkpointing` or nothing you do will stop it from OOMing
+
+**NOTE**: Pre-caching of VAE embeds and text encoder outputs may use more memory and still OOM. If so, text encoder quantisation and VAE tiling can be enabled.
+
+Speed was approximately 1.4 iterations per second on a 4090.
+
+### SageAttention
+
+When using `--attention_mechanism=sageattention`, inference can be sped-up at validation time.
+
+**Note**: This isn't compatible with _every_ model configuration, but it's worth trying.
+
+### NF4-quantised training
+
+In simplest terms, NF4 is a 4bit-_ish_ representation of the model, which means training has serious stability concerns to address.
+
+In early tests, the following holds true:
+- Lion optimiser causes model collapse but uses least VRAM; AdamW variants help to hold it together; bnb-adamw8bit, adamw_bf16 are great choices
+  - AdEMAMix didn't fare well, but settings were not explored
+- `--max_grad_norm=0.01` further helps reduce model breakage by preventing huge changes to the model in too short a time
+- NF4, AdamW8bit, and a higher batch size all help to overcome the stability issues, at the cost of more time spent training or VRAM used
+- Upping the resolution from 512px to 1024px slows training down from, for example, 1.4 seconds per step to 3.5 seconds per step (batch size of 1, 4090)
+- Anything that's difficult to train on int8 or bf16 becomes harder in NF4
+- It's less compatible with options like SageAttention
+
+NF4 does not work with torch.compile, so whatever you get for speed is what you get.
+
+If VRAM is not a concern (eg. 48G or greater) then int8 with torch.compile is your best, fastest option.
+
+### Masked loss
+
+If you are training a subject or style and would like to mask one or the other, see the [masked loss training](/documentation/DREAMBOOTH.md#masked-loss) section of the Dreambooth guide.
+
 ### Classifier-free guidance
 
 #### Problem
@@ -402,9 +482,9 @@ We can partially reintroduce distillation to a de-distilled model by continuing 
   - It allows you to push higher batch sizes and possibly obtain a better result
   - Behaves the same as full-precision training - fp32 won't make your model any better than bf16+int8.
 - **int8** has hardware acceleration and `torch.compile()` support on newer NVIDIA hardware (3090 or better)
-- **nf4** does not seem to benefit training as much as it benefits inference
+- **nf4-bnb** brings VRAM requirements down to 9GB, fitting on a 10G card (with bfloat16 support)
 - When loading the LoRA in ComfyUI later, you **must** use the same base model precision as you trained your LoRA on.
-- **int4** is weird and really only works on A100 and H100 cards due to a reliance on custom bf16 kernels
+- **int4** is relies on custom bf16 kernels, and will not work if your card does not support bfloat16
 
 ### Crashing
 - If you get SIGKILL after the text encoders are unloaded, this means you do not have enough system memory to quantise Flux.
@@ -432,6 +512,9 @@ We can partially reintroduce distillation to a de-distilled model by continuing 
 #### LoKr (--lora_type=lycoris)
 - Higher learning rates are better for LoKr (`1e-3` with AdamW, `2e-4` with Lion)
 - Other algo need more exploration.
+- Setting `is_regularisation_data` on such datasets may help preserve / prevent bleed and improve the final resulting model's quality.
+  - This behaves differently from "prior loss preservation" which is known for doubling training batch sizes and not improving the result much
+  - SimpleTuner's regularisation data implementation provides an efficient manner of preserving the base model
 
 ### Image artifacts
 Flux will immediately absorb bad image artifacts. It's just how it is - a final training run on just high quality data may be required to fix it at the end.
@@ -449,6 +532,21 @@ When you do these things (among others), some square grid artifacts **may** begi
   - This could be a desirable quality, as it keeps aspect-dependent styles like cinematic stuff from bleeding into other resolutions too much.
   - However, if you're looking to improve results equally across many aspect buckets, you might have to experiment with `crop_aspect=random` which comes with its own downsides.
 - Mixing dataset configurations by defining your image directory dataset multiple times has produced really good results and a nicely generalised model.
+
+### Training custom fine-tuned Flux models
+
+Some fine-tuned Flux models on Hugging Face Hub (such as Dev2Pro) lack the full directory structure, requiring these specific options be set.
+
+Make sure to set these options `flux_guidance_value`,  `validation_guidance_real` and `flux_attention_masked_training` according to the way the creator did as well if that information is available. 
+```json
+{
+    "model_family": "flux",
+    "pretrained_model_name_or_path": "black-forest-labs/FLUX.1-dev",
+    "pretrained_transformer_model_name_or_path": "ashen0209/Flux-Dev2Pro",
+    "pretrained_vae_model_name_or_path": "black-forest-labs/FLUX.1-dev",
+    "pretrained_transformer_subfolder": "none",
+}
+```
 
 ## Credits
 

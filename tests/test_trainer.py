@@ -137,6 +137,10 @@ class TestTrainer(unittest.TestCase):
             mixed_precision="bf16",
             report_to="none",
             output_dir="output_dir",
+            flux_schedule_shift=3,
+            flux_schedule_auto_shift=False,
+            validation_guidance_skip_layers=None,
+            gradient_checkpointing_interval=None,
         ),
     )
     def test_misc_init(

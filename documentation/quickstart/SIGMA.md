@@ -42,6 +42,9 @@ python -m venv .venv
 source .venv/bin/activate
 
 pip install -U poetry pip
+
+# Necessary on some systems to prevent it from deciding it knows better than us.
+poetry config virtualenvs.create false
 ```
 
 Depending on your system, you will run one of 3 commands:
@@ -213,3 +216,13 @@ bash train.sh
 This will begin the text embed and VAE output caching to disk.
 
 For more information, see the [dataloader](/documentation/DATALOADER.md) and [tutorial](/TUTORIAL.md) documents.
+
+### CLIP score tracking
+
+If you wish to enable evaluations to score the model's performance, see [this document](/documentation/evaluation/CLIP_SCORES.md) for information on configuring and interpreting CLIP scores.
+
+### SageAttention
+
+When using `--attention_mechanism=sageattention`, inference can be sped-up at validation time.
+
+**Note**: This isn't compatible with _every_ model configuration, but it's worth trying.

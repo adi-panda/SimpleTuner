@@ -27,17 +27,20 @@ if __name__ == "__main__":
         trainer.init_huggingface_hub()
 
         trainer.init_preprocessing_models()
+        trainer.init_precision(preprocessing_models_only=True)
         trainer.init_data_backend()
         trainer.init_validation_prompts()
         trainer.init_unload_text_encoder()
         trainer.init_unload_vae()
 
         trainer.init_load_base_model()
-        trainer.init_precision()
         trainer.init_controlnet_model()
+        trainer.init_precision()
         trainer.init_freeze_models()
         trainer.init_trainable_peft_adapter()
         trainer.init_ema_model()
+        # EMA must be quantised if the base model is as well.
+        trainer.init_precision(ema_only=True)
 
         trainer.move_models(destination="accelerator")
         trainer.init_validations()

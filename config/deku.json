@@ -2,7 +2,7 @@
     {
         "id": "deku-512",
         "type": "local",
-        "instance_data_dir": "/home/azureuser/localfiles/SimpleTuner/DEKU_FULL",
+        "instance_data_dir": "/home/azureuser/localfiles/simpletuner/DEKU_FULL",
         "crop": false,
         "resolution": 512,
         "resolution_type": "pixel_area",
@@ -11,7 +11,7 @@
         "instance_prompt": "",
         "only_instance_prompt": false,
         "caption_strategy": "textfile",
-        "cache_dir_vae": "/home/azureuser/localfiles/SimpleTuner/vae-cache/deku-512",
+        "cache_dir_vae": "/home/azureuser/localfiles/simpletuner/vae-cache/deku-512",
         "probability": 1.0,
         "repeats": 2,
         "preserve_data_backend_cache": true,
@@ -22,7 +22,7 @@
         "type": "local",
         "dataset_type": "text_embeds",
         "default": true,
-        "cache_dir": "/home/azureuser/localfiles/SimpleTuner/embed-cache/deku",
+        "cache_dir": "/home/azureuser/localfiles/simpletuner/embed-cache/deku",
         "disabled": false,
         "write_batch_size": 128
     }

@@ -70,3 +70,4 @@ config/*.toml
 static
 templates
 api_state.json
+DEKU_FULL/
